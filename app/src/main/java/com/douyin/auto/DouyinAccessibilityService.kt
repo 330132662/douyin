@@ -6,6 +6,8 @@ import android.content.Intent
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import com.douyin.auto.config.AppPreferences
 import com.douyin.auto.model.CommentCategory
 import com.douyin.auto.model.CommentInfo
@@ -14,6 +16,8 @@ import com.douyin.auto.model.OperationLog
 import com.douyin.auto.service.AutoFollowEngine
 import com.douyin.auto.service.CommentClassifier
 import com.douyin.auto.service.CommentScanner
+import com.douyin.auto.ui.FloatingAction
+import com.douyin.auto.ui.FloatingDotManager
 import kotlinx.coroutines.*
 
 /**
@@ -65,6 +69,9 @@ class DouyinAccessibilityService : AccessibilityService() {
     private val commentClassifier = CommentClassifier()
     private lateinit var followEngine: AutoFollowEngine
 
+    /** 悬浮操作按钮（小白点） */
+    private var floatingDot: FloatingDotManager? = null
+
     // ---- 状态变量 ----
     @Volatile
     private var lastScanTime: Long = 0L
@@ -84,6 +91,20 @@ class DouyinAccessibilityService : AccessibilityService() {
     /** 当前是否在抖音评论区 */
     @Volatile
     private var isInCommentPage: Boolean = false
+
+    // ---- 翻页（自动滚动评论区）状态机 ----
+    /** 翻页状态：空闲 / 运行中 / 已暂停 */
+    @Volatile
+    private var pageFlipState: PageFlipState = PageFlipState.IDLE
+
+    /** 翻页协程任务 */
+    private var pageFlipJob: Job? = null
+
+    /** 已记录评论去重集合（会话内同一评论只记录一次，避免滚动回看时重复） */
+    private val seenCommentKeys = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+    /** 历史日志缓冲（跨页面/跨时间保留，供日志页读取，避免只在打开页面时记录） */
+    private val logHistory = Collections.synchronizedList(mutableListOf<OperationLog>())
 
     override fun onCreate() {
         super.onCreate()
@@ -131,6 +152,18 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         statusListener?.invoke(true)
         addLog(OperationLog.statusLog("已启动", "无障碍服务连接成功"))
+
+        // 显示悬浮操作按钮（小白点）
+        floatingDot = FloatingDotManager(
+            context = this,
+            actions = listOf(
+                FloatingAction("开始翻页") { startPageFlip() },
+                FloatingAction("暂停翻页") { pausePageFlip() },
+                FloatingAction("继续翻页") { resumePageFlip() },
+                FloatingAction("结束翻页") { stopPageFlip() },
+                FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) }
+            )
+        ).also { it.show() }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -236,14 +269,11 @@ class DouyinAccessibilityService : AccessibilityService() {
 
                 addLog(OperationLog.scanLog(comments.size, "扫描完成"))
 
-                // 2. 分类评论
+                // 2. 分类评论，并记录所有尚未记录过的新评论（去重）
                 val classified = commentClassifier.classifyBatch(comments)
-                for (comment in classified) {
-                    addLog(OperationLog.classifyLog(comment.username, comment.category, comment.matchedKeywords))
-                }
+                recordNewComments(classified)
 
                 val intentComments = classified.filter { it.category == CommentCategory.INTENT }
-                intentCount += intentComments.size
 
                 Log.d(TAG, "分类结果: 总数=${classified.size}, 意向=${intentComments.size}")
 
@@ -279,6 +309,8 @@ class DouyinAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        floatingDot?.dismiss()
+        floatingDot = null
         serviceScope.cancel()
         followEngine.destroy()
         statusListener?.invoke(false)
@@ -289,8 +321,17 @@ class DouyinAccessibilityService : AccessibilityService() {
     // ---- 日志和统计 ----
 
     private fun addLog(log: OperationLog) {
+        logHistory.add(log)
+        if (logHistory.size > 2000) logHistory.removeAt(0)
         logListener?.invoke(log)
         Log.d(TAG, "[${log.action}] ${log.target}: ${log.result} - ${log.detail}")
+    }
+
+    /**
+     * 获取历史日志快照（供 UI 读取，弥补实时监听在页面未打开时遗漏的问题）
+     */
+    fun getLogHistory(): List<OperationLog> = synchronized(logHistory) {
+        ArrayList(logHistory)
     }
 
     private fun notifyStats() {
@@ -330,4 +371,358 @@ class DouyinAccessibilityService : AccessibilityService() {
      * 检查服务是否在评论区
      */
     fun isOnCommentPage(): Boolean = isInCommentPage
+
+    // ---- 悬浮按钮动作 ----
+
+    /**
+     * 将评论区滚动到最后一个评论（向下滚动到底部）。
+     *
+     * 通过无障碍 API 对可滚动的评论列表执行 [AccessibilityNodeInfo.ACTION_SCROLL_FORWARD]，
+     * 直到无法继续滚动或达到 [maxScrolls] 上限（按“最多 100 个评论”的语义限制滚动次数）。
+     *
+     * @param maxScrolls 最多滚动次数上限
+     */
+    fun scrollCommentToEnd(maxScrolls: Int = 100) {
+        serviceScope.launch {
+            var count = 0
+            try {
+                while (count < maxScrolls) {
+                    val ok = tryScrollOnce()
+                    if (!ok) break
+                    count++
+                    delay(500)
+                }
+                if (count == 0) {
+                    addLog(OperationLog.statusLog("滚动失败", "未检测到可滚动的评论区（请先打开抖音评论区）"))
+                } else {
+                    addLog(OperationLog.statusLog("滚动完成", "已将评论区滚动到底部，共 $count 次"))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "滚动评论区出错: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * 单次向下滚动评论列表。
+     * @return 是否成功触发了滚动
+     */
+    private fun tryScrollOnce(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        try {
+            val scrollables = ArrayList<AccessibilityNodeInfo>()
+            fun collect(node: AccessibilityNodeInfo) {
+                if (node != root && node.isScrollable) {
+                    scrollables.add(node)
+                }
+                for (i in 0 until node.childCount) {
+                    val child = node.getChild(i) ?: continue
+                    collect(child)
+                    if (!child.isScrollable) child.recycle()
+                }
+            }
+            collect(root)
+            if (scrollables.isEmpty()) return false
+
+            // 优先选择 RecyclerView / ListView / ScrollView 类节点
+            val target = scrollables.firstOrNull { node ->
+                val cn = node.className?.toString() ?: ""
+                cn.contains("RecyclerView") || cn.contains("ListView") || cn.contains("ScrollView")
+            } ?: scrollables.last()
+
+            val ok = target.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            scrollables.forEach { it.recycle() }
+            return ok
+        } finally {
+            root.recycle()
+        }
+    }
+
+    // ---- 翻页（自动滚动评论区并记录新评论） ----
+
+    /**
+     * 记录一批评论中尚未记录过的新评论（按 uniqueKey 去重，会话内同一评论只记一次）。
+     * @return 本次新记录的评论列表（供调用方进一步处理，如意向客户关注）
+     */
+    private fun recordNewComments(classified: List<CommentInfo>): List<CommentInfo> {
+        val newlyAdded = mutableListOf<CommentInfo>()
+        for (comment in classified) {
+            if (comment.content.isNotBlank() && seenCommentKeys.add(comment.uniqueKey())) {
+                addLog(
+                    OperationLog.commentLog(
+                        username = comment.username,
+                        content = comment.content,
+                        category = comment.category,
+                        keywords = comment.matchedKeywords
+                    )
+                )
+                if (comment.category == CommentCategory.INTENT) intentCount++
+                newlyAdded.add(comment)
+            }
+        }
+        return newlyAdded
+    }
+
+    /**
+     * 开始自动翻页：循环向下滚动评论区，每滚一页扫描一次，逐条记录新出现的评论。
+     * 触底或离开评论区自动结束；若当前处于暂停状态则视为“继续”。
+     */
+    fun startPageFlip() {
+        if (pageFlipState == PageFlipState.PAUSED) {
+            pageFlipState = PageFlipState.RUNNING
+            addLog(OperationLog.statusLog("继续翻页", "已从暂停恢复自动翻页"))
+            return
+        }
+        if (pageFlipJob?.isActive == true) {
+            addLog(OperationLog.statusLog("翻页进行中", "自动翻页已在运行，无需重复开始"))
+            return
+        }
+        pageFlipState = PageFlipState.RUNNING
+        pageFlipJob = serviceScope.launch {
+            addLog(OperationLog.statusLog("开始翻页", "开始自动翻页，新评论将逐条记录"))
+            try {
+                while (isActive && pageFlipState != PageFlipState.IDLE) {
+                    // 暂停时挂起等待，不退出循环
+                    if (pageFlipState == PageFlipState.PAUSED) {
+                        delay(300)
+                        continue
+                    }
+                    // 离开评论区则自动停止
+                    if (!isInCommentPage) {
+                        addLog(OperationLog.statusLog("翻页停止", "已离开抖音评论区，自动停止翻页"))
+                        break
+                    }
+                    // 滚动一页
+                    val scrolled = tryScrollOnce()
+                    // 扫描当前可见评论并记录新评论
+                    val root = rootInActiveWindow
+                    if (root != null) {
+                        try {
+                            val comments = commentScanner.scanComments(root)
+                            val newOnes = recordNewComments(commentClassifier.classifyBatch(comments))
+                            if (newOnes.isNotEmpty()) {
+                                Log.d(TAG, "翻页本轮新增 ${newOnes.size} 条评论")
+                                notifyStats()
+                            }
+                            // 遇到意向客户：暂停翻页 → 进主页关注 → 返回 → 继续
+                            val intentTargets = newOnes
+                                .filter { it.category == CommentCategory.INTENT }
+                                .take(3)
+                            for (target in intentTargets) {
+                                pageFlipState = PageFlipState.PAUSED
+                                addLog(OperationLog.statusLog("暂停翻页", "遇到意向客户 ${target.username}，进入主页关注"))
+                                try {
+                                    followUserViaProfile(target.username)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "关注意向客户 ${target.username} 出错: ${e.message}", e)
+                                    addLog(OperationLog.followLog(target.username, false, "关注流程异常: ${e.message}"))
+                                }
+                                pageFlipState = PageFlipState.RUNNING
+                                delay(300)
+                            }
+                        } finally {
+                            root.recycle()
+                        }
+                    }
+                    if (!scrolled) {
+                        addLog(OperationLog.statusLog("翻页到底", "已滚动到评论区底部，自动结束翻页"))
+                        break
+                    }
+                    delay(800)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "自动翻页出错: ${e.message}", e)
+            } finally {
+                pageFlipJob = null
+                pageFlipState = PageFlipState.IDLE
+            }
+        }
+    }
+
+    /** 暂停自动翻页（仅在运行中有效） */
+    fun pausePageFlip() {
+        if (pageFlipState == PageFlipState.RUNNING) {
+            pageFlipState = PageFlipState.PAUSED
+            addLog(OperationLog.statusLog("暂停翻页", "已暂停自动翻页"))
+        } else {
+            addLog(OperationLog.statusLog("无翻页任务", "当前没有正在运行的翻页任务，无法暂停"))
+        }
+    }
+
+    /** 继续自动翻页（仅在暂停中有效） */
+    fun resumePageFlip() {
+        if (pageFlipState == PageFlipState.PAUSED) {
+            pageFlipState = PageFlipState.RUNNING
+            addLog(OperationLog.statusLog("继续翻页", "已恢复自动翻页"))
+        } else {
+            addLog(OperationLog.statusLog("无暂停任务", "当前没有暂停的翻页任务，无法继续"))
+        }
+    }
+
+    /** 结束自动翻页（取消任务并回到空闲态） */
+    fun stopPageFlip() {
+        if (pageFlipJob?.isActive == true || pageFlipState != PageFlipState.IDLE) {
+            pageFlipJob?.cancel()
+            pageFlipJob = null
+            pageFlipState = PageFlipState.IDLE
+            addLog(OperationLog.statusLog("结束翻页", "已手动结束自动翻页"))
+        } else {
+            addLog(OperationLog.statusLog("无翻页任务", "当前没有运行中的翻页任务"))
+        }
+    }
+
+    // ---- 意向客户：进主页关注 ----
+
+    /**
+     * 遇到意向客户时：在当前评论区点击其头像/昵称进入主页，点击关注后返回评论区。
+     * 整个过程在翻页协程内同步执行（相当于暂停翻页），完成后由调用方恢复 RUNNING。
+     *
+     * @param username 目标用户名
+     * @return 是否成功在主页点击了关注
+     */
+    private suspend fun followUserViaProfile(username: String): Boolean {
+        // 已关注过的用户跳过（避免重复进场）
+        if (prefs.isUserFollowed(username)) {
+            addLog(OperationLog.followLog(username, false, "已关注过，跳过主页关注"))
+            return false
+        }
+
+        // 1. 在评论区找到该用户的可点击入口
+        val root = rootInActiveWindow ?: return false
+        var entry: AccessibilityNodeInfo? = null
+        try {
+            entry = commentScanner.findUserClickableNode(root, username)
+        } finally {
+            root.recycle()
+        }
+        if (entry == null) {
+            addLog(OperationLog.followLog(username, false, "未在当前评论区找到用户入口"))
+            return false
+        }
+
+        // 2. 点击进入主页
+        val clicked = try {
+            entry.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } finally {
+            entry.recycle()
+        }
+        if (!clicked) {
+            addLog(OperationLog.followLog(username, false, "点击用户入口失败"))
+            return false
+        }
+        addLog(OperationLog.statusLog("处理意向客户", "已进入 $username 的主页，准备关注"))
+        delay(1500)
+
+        // 3. 在主页查找并点击“关注”
+        val followed = navigateAndFollowOnProfile(username)
+        if (followed) {
+            prefs.recordFollow(username)
+            followedCount++
+            addLog(OperationLog.followLog(username, true, "已进入主页并关注"))
+        } else {
+            addLog(OperationLog.followLog(username, false, "主页未找到“关注”按钮"))
+        }
+
+        // 4. 返回评论区
+        performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        delay(1200)
+        waitForCommentPage()
+        return followed
+    }
+
+    /**
+     * 在主页窗口中轮询查找“关注”按钮并点击。
+     */
+    private suspend fun navigateAndFollowOnProfile(username: String): Boolean {
+        repeat(8) {
+            val root = rootInActiveWindow ?: return@repeat
+            try {
+                val btn = findFollowButtonOnProfile(root)
+                if (btn != null) {
+                    val ok = btn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    btn.recycle()
+                    if (ok) {
+                        delay(500)
+                        return true
+                    }
+                }
+            } finally {
+                root.recycle()
+            }
+            delay(400)
+        }
+        Log.w(TAG, "主页关注 $username 超时未找到按钮")
+        return false
+    }
+
+    /**
+     * 在主页根节点中查找“关注”按钮（文本命中 [IntentKeywords.UNFOLLOW_TEXTS] 且非已关注态）。
+     */
+    private fun findFollowButtonOnProfile(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        // 策略1: resource-id 匹配
+        for (id in IntentKeywords.DOUYIN_FOLLOW_IDS) {
+            val buttons = root.findAccessibilityNodeInfosByViewId(id)
+            for (b in buttons) {
+                val combined = buildString {
+                    append(b.text?.toString()?.trim() ?: "")
+                    append(" ")
+                    append(b.contentDescription?.toString()?.trim() ?: "")
+                }
+                val isFollow = IntentKeywords.UNFOLLOW_TEXTS.any { it in combined }
+                val isFollowed = IntentKeywords.FOLLOWED_TEXTS.any { it in combined }
+                if (isFollow && !isFollowed) {
+                    return b // 调用方回收
+                }
+                b.recycle()
+            }
+        }
+        // 策略2: 文本查找可点击的关注按钮
+        for (followText in IntentKeywords.UNFOLLOW_TEXTS) {
+            val nodes = root.findAccessibilityNodeInfosByText(followText)
+            var found: AccessibilityNodeInfo? = null
+            for (n in nodes) {
+                val combined = buildString {
+                    append(n.text?.toString()?.trim() ?: "")
+                    append(" ")
+                    append(n.contentDescription?.toString()?.trim() ?: "")
+                }
+                val isFollowed = IntentKeywords.FOLLOWED_TEXTS.any { it in combined }
+                if (found == null && n.isClickable && !isFollowed) {
+                    found = n
+                    continue
+                }
+                n.recycle()
+            }
+            if (found != null) return found
+        }
+        return null
+    }
+
+    /**
+     * 等待回到评论区（轮询检测，超时即返回）。
+     */
+    private suspend fun waitForCommentPage(timeoutMs: Long = 5000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val root = rootInActiveWindow
+            if (root != null) {
+                try {
+                    if (detectCommentPage(root)) return
+                } finally {
+                    root.recycle()
+                }
+            }
+            delay(400)
+        }
+    }
+
+    /** 翻页状态枚举 */
+    private enum class PageFlipState {
+        /** 空闲 */
+        IDLE,
+        /** 运行中 */
+        RUNNING,
+        /** 已暂停 */
+        PAUSED
+    }
 }

@@ -11,7 +11,9 @@ enum class OperationType {
     /** 关注用户 */
     FOLLOW,
     /** 服务状态变更 */
-    STATUS
+    STATUS,
+    /** 评论记录（评论内容 + 评论者昵称） */
+    COMMENT
 }
 
 /**
@@ -61,6 +63,38 @@ data class OperationLog(
             }
             return OperationLog(
                 action = OperationType.CLASSIFY,
+                target = username,
+                result = categoryText,
+                detail = detailText
+            )
+        }
+
+        /**
+         * 创建一条评论记录日志（评论内容 + 评论者昵称）
+         *
+         * @param username 评论者昵称
+         * @param content 评论内容
+         * @param category 分类结果（用作结果标签）
+         * @param keywords 命中的关键词（可选，附在详情末尾）
+         */
+        fun commentLog(
+            username: String,
+            content: String,
+            category: CommentCategory,
+            keywords: List<String> = emptyList()
+        ): OperationLog {
+            val categoryText = when (category) {
+                CommentCategory.NORMAL -> "正常"
+                CommentCategory.AD -> "广告"
+                CommentCategory.INTENT -> "意向客户"
+            }
+            val detailText = if (keywords.isNotEmpty()) {
+                "$content（关键词: ${keywords.joinToString(", ")}）"
+            } else {
+                content
+            }
+            return OperationLog(
+                action = OperationType.COMMENT,
                 target = username,
                 result = categoryText,
                 detail = detailText

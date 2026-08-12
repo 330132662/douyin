@@ -353,4 +353,52 @@ class CommentScanner {
             }
         }
     }
+
+    /**
+     * 在当前窗口中查找指定用户“可点击进入主页”的节点（头像/昵称所在的可点击区域）。
+     *
+     * 实现：先用用户名文本定位其文本节点，再向上回溯找到第一个可点击的祖先（通常是
+     * 整条评论行或头像容器），点击该区域即可打开用户主页。
+     *
+     * @param root 当前窗口根节点（调用方负责回收）
+     * @param username 目标用户名（精确匹配）
+     * @return 可点击节点；找不到返回 null。**调用方负责回收返回的节点**。
+     */
+    fun findUserClickableNode(root: AccessibilityNodeInfo, username: String): AccessibilityNodeInfo? {
+        if (username.isEmpty()) return null
+        val nodes = root.findAccessibilityNodeInfosByText(username)
+        var match: AccessibilityNodeInfo? = null
+        for (n in nodes) {
+            val t = n.text?.toString()?.trim()
+            // 精确匹配，或文本以用户名开头（兼容昵称带 emoji/后缀导致精确匹配失败）
+            if (t == username || (t != null && username.isNotEmpty() && t.startsWith(username))) {
+                match = n
+                break
+            }
+        }
+        // 回收所有非匹配节点
+        for (n in nodes) {
+            if (n != match) n.recycle()
+        }
+        if (match == null) return null
+
+        // 向上回溯找到第一个可点击祖先（兼容 match 自身即可点击的情况）
+        var cur: AccessibilityNodeInfo? = match
+        var clickable: AccessibilityNodeInfo? = null
+        while (cur != null) {
+            if (cur.isClickable) {
+                clickable = cur
+                break
+            }
+            cur = cur.parent
+        }
+
+        // clickable 与 match 为不同节点时才回收 match，避免 clickable==match 时返回已回收节点
+        return if (clickable != null && clickable != match) {
+            match.recycle()
+            clickable
+        } else {
+            match
+        }
+    }
 }

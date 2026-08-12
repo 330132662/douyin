@@ -37,6 +37,10 @@ fun LogScreen(
 
     // 监听日志
     LaunchedEffect(Unit) {
+        // 先预加载服务内缓冲的历史日志（按时间顺序，最新的排在前面）
+        com.douyin.auto.DouyinAccessibilityService.instance
+            ?.getLogHistory()
+            ?.let { logs.addAll(it.asReversed()) }
         com.douyin.auto.DouyinAccessibilityService.logListener = { log ->
             logs.add(0, log) // 最新的在前
             if (logs.size > 500) {
@@ -179,11 +183,11 @@ private fun FilterBar(
                     }
                 )
                 FilterChip(
-                    selected = currentFilter == OperationType.CLASSIFY,
-                    onClick = { onFilterChange(OperationType.CLASSIFY) },
-                    label = { Text("分类") },
+                    selected = currentFilter == OperationType.COMMENT,
+                    onClick = { onFilterChange(OperationType.COMMENT) },
+                    label = { Text("评论") },
                     leadingIcon = {
-                        Icon(Icons.Default.Category, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Comment, contentDescription = null, modifier = Modifier.size(16.dp))
                     }
                 )
                 FilterChip(
@@ -215,6 +219,7 @@ private fun LogItem(log: OperationLog) {
         OperationType.CLASSIFY -> Icons.Default.Category to IntentOrange
         OperationType.FOLLOW -> Icons.Default.PersonAdd to StatusGreen
         OperationType.STATUS -> Icons.Default.Info to AdPurple
+        OperationType.COMMENT -> Icons.Default.Comment to NormalBlue
     }
 
     val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
@@ -328,4 +333,5 @@ private fun actionLabel(action: OperationType): String = when (action) {
     OperationType.CLASSIFY -> "分类"
     OperationType.FOLLOW -> "关注"
     OperationType.STATUS -> "状态"
+    OperationType.COMMENT -> "评论"
 }
