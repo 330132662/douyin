@@ -528,7 +528,8 @@ class DouyinAccessibilityService : AccessibilityService() {
                         addLog(OperationLog.statusLog("翻页到底", "已滚动到评论区底部，自动结束翻页"))
                         break
                     }
-                    delay(800)
+                    // 每轮间隔随机 300~2000ms（含 300、不含 2001 即上限 2000ms），模拟真人节奏、降低被限流概率
+                    delay(kotlin.random.Random.nextLong(300, 2001))
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "自动翻页出错: ${e.message}", e)

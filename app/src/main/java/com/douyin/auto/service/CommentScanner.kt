@@ -97,18 +97,15 @@ class CommentScanner {
                 val comment = extractCommentFromItem(child)
                 if (comment != null) {
                     comments.add(comment)
-                    if (comments.size >= MAX_COMMENTS) {
-                        child.recycle()
-                        break
-                    }
                 }
-                // 递归检查子节点
-                if (child.childCount > 0) {
-                    extractCommentsFromListNode(child, comments)
-                }
+                // 注意：extractCommentFromItem 内部（extractContent/extractUsername 调用的
+                // findLongestText / findFirstNonEmptyText）已经遍历并回收了 child 的子孙节点。
+                // 此处绝不能继续向下递归遍历 child 子树，否则 getChild 会取到对象池中已回收
+                // 复用的同一实例并再次 recycle，触发 "Already in the pool!" 异常使扫描中断。
             } finally {
-                child.recycle()
+                child.recycle() // 每个评论项仅回收一次
             }
+            if (comments.size >= MAX_COMMENTS) break
         }
     }
 
