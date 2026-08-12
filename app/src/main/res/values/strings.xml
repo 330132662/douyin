@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">抖音获客助手</string>
+    <string name="accessibility_service_description">抖音获客助手 - 自动筛选评论区中的意向客户，并支持一键关注。仅扫描评论内容进行分类识别，不会自动点赞或自动评论。</string>
+
+    <!-- 主界面 -->
+    <string name="tab_home">首页</string>
+    <string name="tab_keywords">关键词</string>
+    <string name="tab_logs">日志</string>
+
+    <!-- 服务状态 -->
+    <string name="service_running">服务运行中</string>
+    <string name="service_stopped">服务已停止</string>
+    <string name="btn_start_service">启动服务</string>
+    <string name="btn_stop_service">停止服务</string>
+    <string name="btn_open_accessibility">开启无障碍权限</string>
+
+    <!-- 统计 -->
+    <string name="stat_scanned">扫描评论</string>
+    <string name="stat_intent">意向客户</string>
+    <string name="stat_followed">已关注</string>
+
+    <!-- 关键词设置 -->
+    <string name="intent_keywords">意向关键词</string>
+    <string name="ad_filter_keywords">广告过滤关键词</string>
+    <string name="add_keyword">添加关键词</string>
+    <string name="reset_defaults">恢复默认</string>
+    <string name="keyword_hint">输入关键词</string>
+    <string name="dialog_add_title">添加关键词</string>
+    <string name="btn_confirm">确认</string>
+    <string name="btn_cancel">取消</string>
+
+    <!-- 日志 -->
+    <string name="clear_logs">清除日志</string>
+    <string name="filter_all">全部</string>
+    <string name="filter_scan">扫描</string>
+    <string name="filter_classify">分类</string>
+    <string name="filter_follow">关注</string>
+    <string name="no_logs">暂无操作日志</string>
+
+    <!-- 免责声明 -->
+    <string name="disclaimer_title">免责声明</string>
+    <string name="disclaimer_content">本工具仅用于辅助用户在抖音平台进行评论内容分析和意向客户识别。\n\n1. 请遵守抖音平台用户协议和相关法律法规。\n2. 本工具不会自动点赞、自动评论或进行任何违规操作。\n3. 使用本工具产生的任何后果由用户自行承担。\n4. 请合理使用，避免频繁操作影响账号安全。</string>
+    <string name="btn_got_it">我知道了</string>
+</resources>
