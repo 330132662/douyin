@@ -3,6 +3,7 @@ package com.douyin.auto
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Intent
+import android.os.Build
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -22,6 +23,14 @@ import com.douyin.auto.service.VideoContentAnalyzer
 import com.douyin.auto.ui.FloatingAction
 import com.douyin.auto.ui.FloatingDotManager
 import com.douyin.auto.ui.KeepAliveActivity
+import android.accessibilityservice.GestureDescription
+import android.graphics.Color
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.WindowManager
+import android.widget.TextView
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 
@@ -129,6 +138,16 @@ class DouyinAccessibilityService : AccessibilityService() {
     @Volatile
     private var keepAliveStarted: Boolean = false
 
+    /** 上次尝试自动切换视频的时间戳（切换失败时用于定时重试） */
+    private var lastAdvanceTime: Long = 0L
+
+    /** 临时提示气泡（覆盖层，用于「已点赞 / 已收藏 / 跳过」等决策结果提示） */
+    private var toastView: android.view.View? = null
+    private var toastToken: Int = 0
+    private val overlayWm by lazy {
+        getSystemService(android.content.Context.WINDOW_SERVICE) as WindowManager
+    }
+
     @Volatile
     private var isProcessing: Boolean = false
 
@@ -166,14 +185,19 @@ class DouyinAccessibilityService : AccessibilityService() {
         videoAnalyzer = VideoContentAnalyzer(prefs)
 
         // 配置服务信息
-        val info = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPES_ALL_MASK
-            feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            notificationTimeout = 100
-            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-                    AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE
-        }
+        // 手势能力只能由 manifest 的 android:canPerformGestures="true" 提供——
+        // AccessibilityServiceInfo 里对应的 FLAG_REQUEST_CAN_PERFORM_GESTURES 常量在公共 SDK 是 @hide，
+        // Kotlin 无法引用；canPerformGestures 属性又是只读、无法赋值。
+        // 因此这里用 getServiceInfo() 取「已按 manifest 填充」的实例（其 canPerformGestures 已为 true），
+        // 仅修改 flags、不新建实例，避免把手势能力重置为默认 false。
+        val info = serviceInfo ?: AccessibilityServiceInfo()
+        info.eventTypes = AccessibilityEvent.TYPES_ALL_MASK
+        info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+        info.notificationTimeout = 100
+        info.flags =
+            AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+            AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+            AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE
         setServiceInfo(info)
 
         // 加载用户自定义关键词（使用 combine 避免嵌套 collect 死锁）
@@ -181,14 +205,18 @@ class DouyinAccessibilityService : AccessibilityService() {
             var currentIntentKeywords: Set<String> = emptySet()
             var currentAdKeywords: Set<String> = emptySet()
 
-            val intentJob = launch { prefs.intentKeywordsFlow.collect { currentIntentKeywords = it } }
+            val intentJob =
+                launch { prefs.intentKeywordsFlow.collect { currentIntentKeywords = it } }
             val adJob = launch { prefs.adKeywordsFlow.collect { currentAdKeywords = it } }
 
             // 每 2 秒检查一次并更新分类器
             while (isActive) {
                 delay(2000L)
                 commentClassifier.updateKeywords(currentIntentKeywords, currentAdKeywords)
-                Log.d(TAG, "关键词配置已同步: 意向${currentIntentKeywords.size}个, 广告${currentAdKeywords.size}个")
+                Log.d(
+                    TAG,
+                    "关键词配置已同步: 意向${currentIntentKeywords.size}个, 广告${currentAdKeywords.size}个"
+                )
             }
 
             intentJob.cancel()
@@ -200,20 +228,17 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         // 显示悬浮操作按钮（小白点）
         floatingDot = FloatingDotManager(
-            context = this,
-            actions = listOf(
+            context = this, actions = listOf(
                 FloatingAction("开始翻页") { startPageFlip() },
-                FloatingAction("暂停翻页") { pausePageFlip() },
-                FloatingAction("继续翻页") { resumePageFlip() },
-                FloatingAction("结束翻页") { stopPageFlip() },
-                FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) },
-                FloatingAction("开始视频分析") { startVideoWatch() },
-                FloatingAction("暂停视频分析") { pauseVideoWatch() },
-                FloatingAction("继续视频分析") { resumeVideoWatch() },
-                FloatingAction("结束视频分析") { stopVideoWatch() },
-                FloatingAction("下一视频") { advanceToNextVideo() }
-            )
-        ).also { it.show() }
+            FloatingAction("暂停翻页") { pausePageFlip() },
+            FloatingAction("继续翻页") { resumePageFlip() },
+            FloatingAction("结束翻页") { stopPageFlip() },
+            FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) },
+            FloatingAction("开始散步模式") { startVideoWatch() },
+            FloatingAction("暂停散步") { pauseVideoWatch() },
+            FloatingAction("继续散步") { resumeVideoWatch() },
+            FloatingAction("结束散步") { stopVideoWatch() },
+            FloatingAction("下一视频(手动)") { advanceToNextVideo() })).also { it.show() }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -227,10 +252,10 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         // 处理感兴趣的事件类型
         when (eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED, AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 handleWindowEvent(event)
             }
+
             else -> {
                 // 其他事件类型暂不处理
             }
@@ -452,7 +477,11 @@ class DouyinAccessibilityService : AccessibilityService() {
                     delay(500)
                 }
                 if (count == 0) {
-                    addLog(OperationLog.statusLog("滚动失败", "未检测到可滚动的评论区（请先打开抖音评论区）"))
+                    addLog(
+                        OperationLog.statusLog(
+                            "滚动失败", "未检测到可滚动的评论区（请先打开抖音评论区）"
+                        )
+                    )
                 } else {
                     addLog(OperationLog.statusLog("滚动完成", "已将评论区滚动到底部，共 $count 次"))
                 }
@@ -504,9 +533,7 @@ class DouyinAccessibilityService : AccessibilityService() {
      * （兼容 text 与 contentDescription，用于定位点赞/收藏按钮）。
      */
     private fun findVideoActionNode(
-        root: AccessibilityNodeInfo,
-        labels: List<String>,
-        exclude: List<String>
+        root: AccessibilityNodeInfo, labels: List<String>, exclude: List<String>
     ): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
@@ -544,7 +571,8 @@ class DouyinAccessibilityService : AccessibilityService() {
     private suspend fun performLike(): Boolean {
         val root = rootInActiveWindow ?: return false
         try {
-            val node = findVideoActionNode(root, IntentKeywords.LIKE_TEXTS, IntentKeywords.LIKED_TEXTS)
+            val node =
+                findVideoActionNode(root, IntentKeywords.LIKE_TEXTS, IntentKeywords.LIKED_TEXTS)
             if (node == null) {
                 addLog(OperationLog.likeLog(false, "未找到点赞按钮"))
                 return false
@@ -569,7 +597,9 @@ class DouyinAccessibilityService : AccessibilityService() {
     private suspend fun performCollect(): Boolean {
         val root = rootInActiveWindow ?: return false
         try {
-            val node = findVideoActionNode(root, IntentKeywords.COLLECT_TEXTS, IntentKeywords.COLLECTED_TEXTS)
+            val node = findVideoActionNode(
+                root, IntentKeywords.COLLECT_TEXTS, IntentKeywords.COLLECTED_TEXTS
+            )
             if (node == null) {
                 addLog(OperationLog.collectLog(false, "未找到收藏按钮"))
                 return false
@@ -614,50 +644,95 @@ class DouyinAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 分析当前视频并按配置决定是否点赞/收藏。
+     * 分析当前视频并按配置决定是否点赞/收藏，最后提示用户决策结果。
      */
     private suspend fun analyzeAndAct(identity: String) {
-        addLog(OperationLog.statusLog("视频分析", "正在分析视频：$identity"))
+        addLog(OperationLog.statusLog("散步模式", "正在分析视频：$identity"))
         val result = try {
             videoAnalyzer.analyze()
         } catch (e: Exception) {
             Log.e(TAG, "分析异常: ${e.message}", e)
             addLog(OperationLog.analyzeLog("", false, false, "分析出错：${e.message}"))
+            notifyUser("分析失败：${e.message}")
             return
         }
 
         analyzedCount++
-        addLog(OperationLog.analyzeLog(result.subject, result.shouldLike, result.shouldCollect, result.reason))
+        addLog(
+            OperationLog.analyzeLog(
+                result.subject, result.shouldLike, result.shouldCollect, result.reason
+            )
+        )
         notifyStats()
 
         val auto = prefs.autoExecuteFlow.first()
+        var didLike = false
+        var didCollect = false
         if (auto) {
             if (result.shouldLike) {
                 delay(400)
-                performLike()
+                didLike = performLike()
                 notifyStats()
             }
             if (result.shouldCollect) {
                 delay(400)
-                performCollect()
+                didCollect = performCollect()
                 notifyStats()
             }
         }
+        // 提示用户本视频的决策结果
+        notifyUser(buildDecisionMessage(result, auto, didLike, didCollect))
+    }
+
+    /** 根据分析结果拼装给用户的提示文案 */
+    private fun buildDecisionMessage(
+        result: com.douyin.auto.model.VideoAnalysisResult,
+        auto: Boolean,
+        didLike: Boolean,
+        didCollect: Boolean
+    ): String {
+        val subj = result.subject.ifEmpty { "（无主体）" }
+        val action = buildString {
+            if (result.shouldLike) {
+                append(
+                    when {
+                        !auto -> "建议点赞"
+                        didLike -> "已点赞"
+                        else -> "点赞失败"
+                    }
+                )
+            }
+            if (result.shouldCollect) {
+                if (isNotEmpty()) append(" · ")
+                append(
+                    when {
+                        !auto -> "建议收藏"
+                        didCollect -> "已收藏"
+                        else -> "收藏失败"
+                    }
+                )
+            }
+            if (isEmpty()) append("已跳过（不符合条件）")
+        }
+        return "视频：$subj\n$action"
     }
 
     /**
-     * 开始自动视频分析：循环检测当前刷到的视频，对新视频截帧分析并（可选）点赞/收藏。
-     * 适合用户手动上滑刷视频时使用；每次刷到新视频自动触发一次分析。
+     * 启动「散步模式」：在抖音推荐流自动截帧分析。
+     * 每刷到一个新视频：抓取前 ~10 秒随机几帧 → 调用大模型识别 → 按本地点赞/收藏条件
+     * 自动点赞/收藏 → 顶部气泡提示决策结果 → 自动切换下一个视频继续分析。
      */
     fun startVideoWatch() {
         if (videoWatchJob?.isActive == true) {
-            addLog(OperationLog.statusLog("视频分析", "视频分析已在运行"))
+            addLog(OperationLog.statusLog("散步模式", "散步模式已在运行"))
             return
         }
         isVideoWatching = true
         videoWatchPaused = false
+        isAnalyzingVideo = false
+        lastVideoIdentity = null
         videoWatchJob = serviceScope.launch {
-            addLog(OperationLog.statusLog("视频分析", "开始自动分析刷到的视频"))
+            addLog(OperationLog.statusLog("散步模式", "开始散步模式：自动截帧分析并切换下一个视频"))
             try {
                 while (isActive && isVideoWatching) {
                     if (videoWatchPaused) {
@@ -672,7 +747,11 @@ class DouyinAccessibilityService : AccessibilityService() {
                         if (keepAliveStarted) stopKeepAlive()
                         val now = System.currentTimeMillis()
                         if (now - lastCaptureMissingLog > 10_000) {
-                            addLog(OperationLog.statusLog("视频分析", "录屏未授权，无法分析（请先在「模型」页开启录屏）"))
+                            addLog(
+                                OperationLog.statusLog(
+                                    "散步模式", "录屏未授权，无法分析（请先在「模型」页开启录屏）"
+                                )
+                            )
                             lastCaptureMissingLog = now
                         }
                         delay(5000)
@@ -689,19 +768,31 @@ class DouyinAccessibilityService : AccessibilityService() {
                         try {
                             val identity = detectVideoIdentity(root)
                             if (identity != null && identity != lastVideoIdentity) {
+                                // 刷到新视频：抓取前 10 秒随机几帧 → 分析 → 自动点赞/收藏 → 提示 → 切下一个
                                 lastVideoIdentity = identity
                                 isAnalyzingVideo = true
                                 analyzeAndAct(identity)
                                 isAnalyzingVideo = false
+                                advanceToNextVideo()
+                                lastAdvanceTime = System.currentTimeMillis()
+                                delay(2600) // 等待下一个视频加载并播放
+                            } else {
+                                // 仍是同一个视频：若切换失败则定时重试，否则稍后再看
+                                if (lastVideoIdentity != null && System.currentTimeMillis() - lastAdvanceTime > 6000) {
+                                    advanceToNextVideo()
+                                    lastAdvanceTime = System.currentTimeMillis()
+                                }
+                                delay(1200)
                             }
                         } finally {
                             root.recycle()
                         }
+                    } else {
+                        delay(1200)
                     }
-                    delay(1200)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "视频分析循环出错: ${e.message}", e)
+                Log.e(TAG, "散步模式循环出错: ${e.message}", e)
             } finally {
                 videoWatchJob = null
                 isVideoWatching = false
@@ -713,7 +804,7 @@ class DouyinAccessibilityService : AccessibilityService() {
     fun pauseVideoWatch() {
         if (isVideoWatching && !videoWatchPaused) {
             videoWatchPaused = true
-            addLog(OperationLog.statusLog("视频分析", "已暂停自动视频分析"))
+            addLog(OperationLog.statusLog("散步模式", "已暂停散步模式"))
         }
     }
 
@@ -721,7 +812,7 @@ class DouyinAccessibilityService : AccessibilityService() {
     fun resumeVideoWatch() {
         if (isVideoWatching && videoWatchPaused) {
             videoWatchPaused = false
-            addLog(OperationLog.statusLog("视频分析", "已恢复自动视频分析"))
+            addLog(OperationLog.statusLog("散步模式", "已恢复散步模式"))
         }
     }
 
@@ -733,7 +824,7 @@ class DouyinAccessibilityService : AccessibilityService() {
             isVideoWatching = false
             videoWatchPaused = false
             stopKeepAlive()
-            addLog(OperationLog.statusLog("视频分析", "已结束自动视频分析"))
+            addLog(OperationLog.statusLog("散步模式", "已结束散步模式"))
         }
     }
 
@@ -758,16 +849,97 @@ class DouyinAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** 切换到下一个视频（尝试对可滚动节点执行向前滚动；失败则提示手动上滑） */
+    /**
+     * 切换到下一个视频：优先用无障碍手势向上滑动（抖音推荐流标准切下一个手势），
+     * 失败（如未授予手势权限）再退化为对可滚动节点执行向前滚动。
+     */
     fun advanceToNextVideo() {
         serviceScope.launch {
-            val ok = tryScrollOnce()
+            val ok = goToNextVideoByGesture() || tryScrollOnce()
             addLog(
                 OperationLog.statusLog(
-                    "下一视频",
-                    if (ok) "已尝试切换到下一个视频" else "未能自动切换（请手动上滑到下一个视频）"
+                    "散步模式",
+                    if (ok) "已切换到下一个视频" else "未能自动切换（请检查无障碍「执行手势」权限）"
                 )
             )
+        }
+    }
+
+    /**
+     * 通过无障碍手势向上滑动，切换到抖音的下一个视频。
+     * 需要 accessibility_service_config 中 android:canPerformGestures="true"（已开启）。
+     */
+    private fun goToNextVideoByGesture(): Boolean {
+        val dm = resources.displayMetrics
+        val midX = dm.widthPixels / 2f
+        val startY = dm.heightPixels * 0.82f
+        val endY = dm.heightPixels * 0.18f
+        val path = Path().apply {
+            moveTo(midX, startY)
+            lineTo(midX, endY)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 300)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        return runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
+    }
+
+    /** 在抖音界面顶部居中显示一条临时提示气泡（约 2.8 秒后自动消失），用于决策结果提示 */
+    private fun notifyUser(message: String) {
+        serviceScope.launch(Dispatchers.Main) {
+            showTransientToast(message)
+        }
+    }
+
+    private fun showTransientToast(text: String) {
+        val token = ++toastToken
+        try {
+            toastView?.let { overlayWm.removeView(it) }
+        } catch (_: Exception) {
+        }
+        toastView = null
+
+        val dm = resources.displayMetrics
+        val density = dm.density
+        val tv = TextView(this@DouyinAccessibilityService).apply {
+            this.text = text
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setPadding(
+                (14 * density).toInt(),
+                (10 * density).toInt(),
+                (14 * density).toInt(),
+                (10 * density).toInt()
+            )
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 16 * density
+                setColor(Color.parseColor("#D9000000"))
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            else WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = (90 * density).toInt()
+        }
+        toastView = tv
+        runCatching { overlayWm.addView(tv, params) }
+
+        serviceScope.launch(Dispatchers.Main) {
+            delay(2800)
+            if (toastToken == token) {
+                try {
+                    toastView?.let { overlayWm.removeView(it) }
+                } catch (_: Exception) {
+                }
+                toastView = null
+            }
         }
     }
 
@@ -832,23 +1004,33 @@ class DouyinAccessibilityService : AccessibilityService() {
                     if (root != null) {
                         try {
                             val comments = commentScanner.scanComments(root)
-                            val newOnes = recordNewComments(commentClassifier.classifyBatch(comments))
+                            val newOnes =
+                                recordNewComments(commentClassifier.classifyBatch(comments))
                             if (newOnes.isNotEmpty()) {
                                 Log.d(TAG, "翻页本轮新增 ${newOnes.size} 条评论")
                                 notifyStats()
                             }
                             // 遇到意向客户：暂停翻页 → 进主页关注 → 返回 → 继续
-                            val intentTargets = newOnes
-                                .filter { it.category == CommentCategory.INTENT }
-                                .take(3)
+                            val intentTargets =
+                                newOnes.filter { it.category == CommentCategory.INTENT }.take(3)
                             for (target in intentTargets) {
                                 pageFlipState = PageFlipState.PAUSED
-                                addLog(OperationLog.statusLog("暂停翻页", "遇到意向客户 ${target.username}，进入主页关注"))
+                                addLog(
+                                    OperationLog.statusLog(
+                                        "暂停翻页", "遇到意向客户 ${target.username}，进入主页关注"
+                                    )
+                                )
                                 try {
                                     followUserViaProfile(target.username)
                                 } catch (e: Exception) {
-                                    Log.e(TAG, "关注意向客户 ${target.username} 出错: ${e.message}", e)
-                                    addLog(OperationLog.followLog(target.username, false, "关注流程异常: ${e.message}"))
+                                    Log.e(
+                                        TAG, "关注意向客户 ${target.username} 出错: ${e.message}", e
+                                    )
+                                    addLog(
+                                        OperationLog.followLog(
+                                            target.username, false, "关注流程异常: ${e.message}"
+                                        )
+                                    )
                                 }
                                 pageFlipState = PageFlipState.RUNNING
                                 delay(300)
@@ -858,7 +1040,11 @@ class DouyinAccessibilityService : AccessibilityService() {
                         }
                     }
                     if (!scrolled) {
-                        addLog(OperationLog.statusLog("翻页到底", "已滚动到评论区底部，自动结束翻页"))
+                        addLog(
+                            OperationLog.statusLog(
+                                "翻页到底", "已滚动到评论区底部，自动结束翻页"
+                            )
+                        )
                         break
                     }
                     // 每轮间隔随机 300~2000ms（含 300、不含 2001 即上限 2000ms），模拟真人节奏、降低被限流概率
@@ -1054,8 +1240,10 @@ class DouyinAccessibilityService : AccessibilityService() {
     private enum class PageFlipState {
         /** 空闲 */
         IDLE,
+
         /** 运行中 */
         RUNNING,
+
         /** 已暂停 */
         PAUSED
     }
