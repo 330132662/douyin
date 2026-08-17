@@ -23,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.douyin.auto.DouyinAccessibilityService
+import com.douyin.auto.Page
 import com.douyin.auto.ui.theme.*
 
 /**
@@ -33,8 +34,11 @@ import com.douyin.auto.ui.theme.*
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
+    currentPage: Page = Page.HOME,
+    onNavigateToHome: () -> Unit = {},
     onNavigateToKeywords: () -> Unit = {},
-    onNavigateToLogs: () -> Unit = {}
+    onNavigateToLogs: () -> Unit = {},
+    onNavigateToModel: () -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -95,19 +99,25 @@ fun MainScreen(
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(
-                    selected = true,
-                    onClick = { /* 已在首页 */ },
+                    selected = currentPage == Page.HOME,
+                    onClick = onNavigateToHome,
                     icon = { Icon(Icons.Default.Home, contentDescription = "首页") },
                     label = { Text("首页") }
                 )
                 NavigationBarItem(
-                    selected = false,
+                    selected = currentPage == Page.KEYWORDS,
                     onClick = onNavigateToKeywords,
                     icon = { Icon(Icons.Default.Settings, contentDescription = "关键词") },
                     label = { Text("关键词") }
                 )
                 NavigationBarItem(
-                    selected = false,
+                    selected = currentPage == Page.MODEL,
+                    onClick = onNavigateToModel,
+                    icon = { Icon(Icons.Default.AutoAwesome, contentDescription = "模型") },
+                    label = { Text("模型") }
+                )
+                NavigationBarItem(
+                    selected = currentPage == Page.LOGS,
                     onClick = onNavigateToLogs,
                     icon = { Icon(Icons.Default.ListAlt, contentDescription = "日志") },
                     label = { Text("日志") }
@@ -262,6 +272,33 @@ private fun StatsCard(stats: DouyinAccessibilityService.Stats) {
                     label = "已关注",
                     value = stats.followedCount.toString(),
                     color = StatusGreen
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 视频分析统计（新增）
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                StatItem(
+                    icon = Icons.Default.AutoAwesome,
+                    label = "已分析",
+                    value = stats.analyzedCount.toString(),
+                    color = NormalBlue
+                )
+                StatItem(
+                    icon = Icons.Default.Favorite,
+                    label = "已点赞",
+                    value = stats.likedCount.toString(),
+                    color = StatusRed
+                )
+                StatItem(
+                    icon = Icons.Default.Bookmark,
+                    label = "已收藏",
+                    value = stats.collectedCount.toString(),
+                    color = IntentOrange
                 )
             }
         }
@@ -426,9 +463,9 @@ private fun UsageTipsCard() {
 
             Text(
                 text = "1. 在系统设置中开启本服务的无障碍权限\n" +
-                        "2. 打开抖音 App，进入任意视频的评论区\n" +
-                        "3. 服务将自动扫描评论，分类识别意向客户\n" +
-                        "4. 识别到意向客户后将自动关注",
+                        "2. 打开抖音 App，进入任意视频的评论区，自动扫描评论并关注意向客户\n" +
+                        "3. 在「模型」页配置国产大模型并授权录屏，可开启视频内容分析\n" +
+                        "4. 刷视频时点小白点「开始视频分析」，自动截帧分析主体并（可选）点赞/收藏",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 lineHeight = 20.sp
@@ -437,7 +474,7 @@ private fun UsageTipsCard() {
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "⚠️ 免责声明：本工具仅供辅助使用，请遵守抖音平台规则和相关法律法规。不会自动点赞或自动评论。",
+                text = "⚠️ 免责声明：本工具仅供辅助使用，请遵守抖音平台规则和相关法律法规。视频点赞/收藏仅在「模型」页开启「自动点赞/收藏」后才会执行，请合理使用避免影响账号安全。",
                 style = MaterialTheme.typography.bodySmall,
                 color = StatusRed.copy(alpha = 0.8f),
                 lineHeight = 18.sp,

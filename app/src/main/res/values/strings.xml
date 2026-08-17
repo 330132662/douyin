@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">抖音获客助手</string>
-    <string name="accessibility_service_description">抖音获客助手 - 自动筛选评论区中的意向客户，并支持一键关注。仅扫描评论内容进行分类识别，不会自动点赞或自动评论。</string>
+    <string name="accessibility_service_description">抖音获客助手 - 自动筛选评论区中的意向客户并关注；在开启「视频内容分析」后，可通过系统录屏截帧调用你配置的国产大模型分析视频主体，并按条件自动点赞/收藏。请遵守平台规则，合理使用。</string>
 
     <!-- 主界面 -->
     <string name="tab_home">首页</string>

@@ -198,6 +198,30 @@ private fun FilterBar(
                         Icon(Icons.Default.PersonAdd, contentDescription = null, modifier = Modifier.size(16.dp))
                     }
                 )
+                FilterChip(
+                    selected = currentFilter == OperationType.ANALYZE,
+                    onClick = { onFilterChange(OperationType.ANALYZE) },
+                    label = { Text("分析") },
+                    leadingIcon = {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                )
+                FilterChip(
+                    selected = currentFilter == OperationType.LIKE,
+                    onClick = { onFilterChange(OperationType.LIKE) },
+                    label = { Text("点赞") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Favorite, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                )
+                FilterChip(
+                    selected = currentFilter == OperationType.COLLECT,
+                    onClick = { onFilterChange(OperationType.COLLECT) },
+                    label = { Text("收藏") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                )
             }
             Text(
                 text = "共 $totalCount 条日志${if (currentFilter != null) " · 筛选后 $filteredCount 条" else ""}",
@@ -220,6 +244,9 @@ private fun LogItem(log: OperationLog) {
         OperationType.FOLLOW -> Icons.Default.PersonAdd to StatusGreen
         OperationType.STATUS -> Icons.Default.Info to AdPurple
         OperationType.COMMENT -> Icons.Default.Comment to NormalBlue
+        OperationType.ANALYZE -> Icons.Default.AutoAwesome to Primary
+        OperationType.LIKE -> Icons.Default.Favorite to StatusRed
+        OperationType.COLLECT -> Icons.Default.Bookmark to IntentOrange
     }
 
     val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
@@ -334,4 +361,7 @@ private fun actionLabel(action: OperationType): String = when (action) {
     OperationType.FOLLOW -> "关注"
     OperationType.STATUS -> "状态"
     OperationType.COMMENT -> "评论"
+    OperationType.ANALYZE -> "分析"
+    OperationType.LIKE -> "点赞"
+    OperationType.COLLECT -> "收藏"
 }

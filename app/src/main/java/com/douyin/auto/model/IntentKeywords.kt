@@ -92,6 +92,33 @@ object IntentKeywords {
         "关注", "Follow", "+ 关注"
     )
 
+    // ---- 视频分析：点赞 / 收藏 按钮定位 ----
+
+    /** 抖音视频页作者名 resource-id 候选（用于识别「当前是哪一个视频」） */
+    val DOUYIN_VIDEO_AUTHOR_IDS: List<String> = listOf(
+        "com.ss.android.ugc.aweme:id/author_name",
+        "com.ss.android.ugc.aweme:id/user_name",
+        "com.ss.android.ugc.aweme:id/nickname"
+    )
+
+    /** 抖音视频页文案 / 标题 resource-id 候选（用于识别「当前是哪一个视频」） */
+    val DOUYIN_VIDEO_CAPTION_IDS: List<String> = listOf(
+        "com.ss.android.ugc.aweme:id/desc",
+        "com.ss.android.ugc.aweme:id/title"
+    )
+
+    /** 点赞按钮文本命中（含 contentDescription） */
+    val LIKE_TEXTS: List<String> = listOf("点赞", "赞")
+
+    /** 已点赞状态文本（用于跳过，避免重复点赞） */
+    val LIKED_TEXTS: List<String> = listOf("已赞", "取消赞")
+
+    /** 收藏按钮文本命中（含 contentDescription） */
+    val COLLECT_TEXTS: List<String> = listOf("收藏")
+
+    /** 已收藏状态文本（用于跳过，避免重复收藏） */
+    val COLLECTED_TEXTS: List<String> = listOf("已收藏", "取消收藏")
+
     /** 评论页面特征文本（用于判断当前是否在评论区） */
     val COMMENT_PAGE_TEXTS: List<String> = listOf(
         "评论", "共", "条评论", "回复"

@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.douyin.auto.model.IntentKeywords
@@ -53,9 +54,45 @@ class AppPreferences(private val context: Context) {
         /** 已关注的用户名集合（去重用） */
         val KEY_FOLLOWED_USERS = stringSetPreferencesKey("followed_users")
 
+        // ---- 视频内容分析（国产大模型）配置 ----
+        /** 大模型 API 地址（OpenAI 兼容，结尾不带 /） */
+        val KEY_API_BASE_URL = stringPreferencesKey("api_base_url")
+
+        /** 大模型 API Key（敏感值，明文存储于 DataStore） */
+        val KEY_API_KEY = stringPreferencesKey("api_key")
+
+        /** 模型名称（如 qwen-vl-max / glm-4v-flash / deepseek-vl 等） */
+        val KEY_MODEL_NAME = stringPreferencesKey("model_name")
+
+        /** 是否启用视频内容分析 */
+        val KEY_ANALYSIS_ENABLED = booleanPreferencesKey("analysis_enabled")
+
+        /** 判定命中后是否自动点赞/收藏 */
+        val KEY_AUTO_EXECUTE = booleanPreferencesKey("auto_execute")
+
+        /** 点赞条件（自然语言描述） */
+        val KEY_LIKE_CRITERIA = stringPreferencesKey("like_criteria")
+
+        /** 收藏条件（自然语言描述） */
+        val KEY_COLLECT_CRITERIA = stringPreferencesKey("collect_criteria")
+
+        /** 截帧数量（1-8） */
+        val KEY_FRAME_COUNT = intPreferencesKey("frame_count")
+
+        /** 截帧窗口时长（毫秒，默认 10000 = 视频前 10 秒） */
+        val KEY_CAPTURE_WINDOW_MS = intPreferencesKey("capture_window_ms")
+
         // ---- 默认值 ----
         const val DEFAULT_DAILY_FOLLOW_LIMIT = 200
         const val DEFAULT_MAX_OPS_PER_SECOND = 2
+        const val DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
+        const val DEFAULT_MODEL_NAME = "gpt-4o"
+        const val DEFAULT_LIKE_CRITERIA =
+            "视频内容属于我感兴趣的主题（如美食、旅行、科技数码、宠物、知识干货等），画面质量高、有吸引力"
+        const val DEFAULT_COLLECT_CRITERIA =
+            "视频具有收藏价值：教程/干货/知识类、可复用的方法、值得回看的内容"
+        const val DEFAULT_FRAME_COUNT = 3
+        const val DEFAULT_CAPTURE_WINDOW_MS = 10000
     }
 
     // ---- 响应式数据流 ----
@@ -93,6 +130,53 @@ class AppPreferences(private val context: Context) {
     /** 已关注用户 Flow */
     val followedUsersFlow: Flow<Set<String>> = context.dataStore.data.map { prefs ->
         prefs[KEY_FOLLOWED_USERS] ?: emptySet()
+    }
+
+    // ---- 视频内容分析配置 Flow ----
+
+    /** 大模型 API 地址 Flow */
+    val apiBaseUrlFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[KEY_API_BASE_URL] ?: DEFAULT_API_BASE_URL
+    }
+
+    /** 大模型 API Key Flow */
+    val apiKeyFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[KEY_API_KEY] ?: ""
+    }
+
+    /** 模型名称 Flow */
+    val modelNameFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[KEY_MODEL_NAME] ?: DEFAULT_MODEL_NAME
+    }
+
+    /** 是否启用视频分析 Flow */
+    val analysisEnabledFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[KEY_ANALYSIS_ENABLED] ?: false
+    }
+
+    /** 自动执行（点赞/收藏）Flow */
+    val autoExecuteFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[KEY_AUTO_EXECUTE] ?: true
+    }
+
+    /** 点赞条件 Flow */
+    val likeCriteriaFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[KEY_LIKE_CRITERIA] ?: DEFAULT_LIKE_CRITERIA
+    }
+
+    /** 收藏条件 Flow */
+    val collectCriteriaFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[KEY_COLLECT_CRITERIA] ?: DEFAULT_COLLECT_CRITERIA
+    }
+
+    /** 截帧数量 Flow */
+    val frameCountFlow: Flow<Int> = context.dataStore.data.map { prefs ->
+        prefs[KEY_FRAME_COUNT] ?: DEFAULT_FRAME_COUNT
+    }
+
+    /** 截帧窗口时长 Flow */
+    val captureWindowMsFlow: Flow<Int> = context.dataStore.data.map { prefs ->
+        prefs[KEY_CAPTURE_WINDOW_MS] ?: DEFAULT_CAPTURE_WINDOW_MS
     }
 
     // ---- 写入方法 ----
@@ -149,6 +233,71 @@ class AppPreferences(private val context: Context) {
     suspend fun setServiceEnabled(enabled: Boolean) {
         context.dataStore.edit { prefs ->
             prefs[KEY_SERVICE_ENABLED] = enabled
+        }
+    }
+
+    // ---- 视频内容分析配置写入 ----
+
+    /** 设置大模型 API 地址（自动去除结尾的 /） */
+    suspend fun setApiBaseUrl(url: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_API_BASE_URL] = url.trim().trimEnd('/')
+        }
+    }
+
+    /** 设置大模型 API Key */
+    suspend fun setApiKey(key: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_API_KEY] = key.trim()
+        }
+    }
+
+    /** 设置模型名称 */
+    suspend fun setModelName(name: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_MODEL_NAME] = name.trim()
+        }
+    }
+
+    /** 设置是否启用视频分析 */
+    suspend fun setAnalysisEnabled(enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_ANALYSIS_ENABLED] = enabled
+        }
+    }
+
+    /** 设置是否自动点赞/收藏 */
+    suspend fun setAutoExecute(enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_AUTO_EXECUTE] = enabled
+        }
+    }
+
+    /** 设置点赞条件 */
+    suspend fun setLikeCriteria(criteria: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_LIKE_CRITERIA] = criteria
+        }
+    }
+
+    /** 设置收藏条件 */
+    suspend fun setCollectCriteria(criteria: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_COLLECT_CRITERIA] = criteria
+        }
+    }
+
+    /** 设置截帧数量（1-8） */
+    suspend fun setFrameCount(count: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_FRAME_COUNT] = count.coerceIn(1, 8)
+        }
+    }
+
+    /** 设置截帧窗口时长（毫秒，3000-30000） */
+    suspend fun setCaptureWindowMs(ms: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_CAPTURE_WINDOW_MS] = ms.coerceIn(3000, 30000)
         }
     }
 

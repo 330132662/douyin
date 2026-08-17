@@ -11,6 +11,7 @@ import androidx.compose.ui.Modifier
 import com.douyin.auto.ui.KeywordSettingsScreen
 import com.douyin.auto.ui.LogScreen
 import com.douyin.auto.ui.MainScreen
+import com.douyin.auto.ui.ModelSettingsScreen
 import com.douyin.auto.ui.theme.DouyinAutoTheme
 
 /**
@@ -54,8 +55,11 @@ private fun MainApp() {
     when (currentPage) {
         Page.HOME -> {
             MainScreen(
+                currentPage = Page.HOME,
+                onNavigateToHome = { currentPage = Page.HOME },
                 onNavigateToKeywords = { currentPage = Page.KEYWORDS },
-                onNavigateToLogs = { currentPage = Page.LOGS }
+                onNavigateToLogs = { currentPage = Page.LOGS },
+                onNavigateToModel = { currentPage = Page.MODEL }
             )
         }
         Page.KEYWORDS -> {
@@ -68,12 +72,17 @@ private fun MainApp() {
                 onNavigateBack = { currentPage = Page.HOME }
             )
         }
+        Page.MODEL -> {
+            ModelSettingsScreen(
+                onNavigateBack = { currentPage = Page.HOME }
+            )
+        }
     }
 }
 
 /**
  * 页面枚举
  */
-private enum class Page {
-    HOME, KEYWORDS, LOGS
+enum class Page {
+    HOME, KEYWORDS, LOGS, MODEL
 }

@@ -6,9 +6,11 @@ import android.content.Intent
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.ArrayDeque
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import com.douyin.auto.config.AppPreferences
+import com.douyin.auto.media.ScreenCaptureService
 import com.douyin.auto.model.CommentCategory
 import com.douyin.auto.model.CommentInfo
 import com.douyin.auto.model.IntentKeywords
@@ -16,9 +18,11 @@ import com.douyin.auto.model.OperationLog
 import com.douyin.auto.service.AutoFollowEngine
 import com.douyin.auto.service.CommentClassifier
 import com.douyin.auto.service.CommentScanner
+import com.douyin.auto.service.VideoContentAnalyzer
 import com.douyin.auto.ui.FloatingAction
 import com.douyin.auto.ui.FloatingDotManager
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 
 /**
  * 抖音无障碍服务 - 核心服务
@@ -35,6 +39,9 @@ class DouyinAccessibilityService : AccessibilityService() {
         val scannedCount: Int = 0,
         val intentCount: Int = 0,
         val followedCount: Int = 0,
+        val analyzedCount: Int = 0,
+        val likedCount: Int = 0,
+        val collectedCount: Int = 0,
         val lastScanTime: Long = 0L
     )
 
@@ -85,6 +92,38 @@ class DouyinAccessibilityService : AccessibilityService() {
     @Volatile
     private var followedCount: Int = 0
 
+    // ---- 视频内容分析相关状态 ----
+    @Volatile
+    private var analyzedCount: Int = 0
+
+    @Volatile
+    private var likedCount: Int = 0
+
+    @Volatile
+    private var collectedCount: Int = 0
+
+    /** 视频内容分析编排器 */
+    private lateinit var videoAnalyzer: VideoContentAnalyzer
+
+    /** 视频分析（自动刷视频）运行状态 */
+    @Volatile
+    private var isVideoWatching: Boolean = false
+
+    @Volatile
+    private var videoWatchPaused: Boolean = false
+
+    /** 视频分析循环任务 */
+    private var videoWatchJob: Job? = null
+
+    /** 最近一次已分析视频的身份标识（作者+文案），用于去重避免重复分析 */
+    private var lastVideoIdentity: String? = null
+
+    @Volatile
+    private var isAnalyzingVideo: Boolean = false
+
+    /** 录屏缺失日志节流时间戳 */
+    private var lastCaptureMissingLog: Long = 0L
+
     @Volatile
     private var isProcessing: Boolean = false
 
@@ -119,6 +158,7 @@ class DouyinAccessibilityService : AccessibilityService() {
         // 初始化组件
         prefs = AppPreferences(this)
         followEngine = AutoFollowEngine(prefs, serviceScope)
+        videoAnalyzer = VideoContentAnalyzer(prefs)
 
         // 配置服务信息
         val info = AccessibilityServiceInfo().apply {
@@ -161,7 +201,12 @@ class DouyinAccessibilityService : AccessibilityService() {
                 FloatingAction("暂停翻页") { pausePageFlip() },
                 FloatingAction("继续翻页") { resumePageFlip() },
                 FloatingAction("结束翻页") { stopPageFlip() },
-                FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) }
+                FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) },
+                FloatingAction("开始视频分析") { startVideoWatch() },
+                FloatingAction("暂停视频分析") { pauseVideoWatch() },
+                FloatingAction("继续视频分析") { resumeVideoWatch() },
+                FloatingAction("结束视频分析") { stopVideoWatch() },
+                FloatingAction("下一视频") { advanceToNextVideo() }
             )
         ).also { it.show() }
     }
@@ -340,6 +385,9 @@ class DouyinAccessibilityService : AccessibilityService() {
                 scannedCount = scannedCount,
                 intentCount = intentCount,
                 followedCount = followedCount,
+                analyzedCount = analyzedCount,
+                likedCount = likedCount,
+                collectedCount = collectedCount,
                 lastScanTime = lastScanTime
             )
         )
@@ -352,6 +400,9 @@ class DouyinAccessibilityService : AccessibilityService() {
         scannedCount = 0
         intentCount = 0
         followedCount = 0
+        analyzedCount = 0
+        likedCount = 0
+        collectedCount = 0
         notifyStats()
     }
 
@@ -363,6 +414,9 @@ class DouyinAccessibilityService : AccessibilityService() {
             scannedCount = scannedCount,
             intentCount = intentCount,
             followedCount = followedCount,
+            analyzedCount = analyzedCount,
+            likedCount = likedCount,
+            collectedCount = collectedCount,
             lastScanTime = lastScanTime
         )
     }
@@ -435,6 +489,255 @@ class DouyinAccessibilityService : AccessibilityService() {
             return ok
         } finally {
             root.recycle()
+        }
+    }
+
+    // ---- 视频内容分析：点赞 / 收藏 / 自动刷视频 ----
+
+    /**
+     * 在根节点中查找匹配 [labels] 且未命中 [exclude] 的可点击节点
+     * （兼容 text 与 contentDescription，用于定位点赞/收藏按钮）。
+     */
+    private fun findVideoActionNode(
+        root: AccessibilityNodeInfo,
+        labels: List<String>,
+        exclude: List<String>
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var found: AccessibilityNodeInfo? = null
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val isRoot = node == root
+            val label = buildString {
+                append(node.text?.toString() ?: "")
+                append(" ")
+                append(node.contentDescription?.toString() ?: "")
+                append(" ")
+                append(node.viewIdResourceName ?: "")
+            }.lowercase()
+            val hit = labels.any { it.lowercase() in label }
+            val excl = exclude.any { it.lowercase() in label }
+            if (hit && !excl && node.isClickable) {
+                found = node
+                break
+            }
+            repeat(node.childCount) { i ->
+                node.getChild(i)?.let { queue.add(it) }
+            }
+            // 仅回收非根节点，根节点由调用方在 finally 中回收
+            if (!isRoot) node.recycle()
+        }
+        // 回收队列中剩余节点（found 已移出队列，由调用方回收）
+        while (queue.isNotEmpty()) queue.removeFirst().recycle()
+        return found
+    }
+
+    /**
+     * 对当前视频执行点赞（若已点赞则跳过）。
+     */
+    private suspend fun performLike(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        try {
+            val node = findVideoActionNode(root, IntentKeywords.LIKE_TEXTS, IntentKeywords.LIKED_TEXTS)
+            if (node == null) {
+                addLog(OperationLog.likeLog(false, "未找到点赞按钮"))
+                return false
+            }
+            val ok = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            node.recycle()
+            if (ok) {
+                likedCount++
+                addLog(OperationLog.likeLog(true))
+            } else {
+                addLog(OperationLog.likeLog(false, "点击失败"))
+            }
+            return ok
+        } finally {
+            root.recycle()
+        }
+    }
+
+    /**
+     * 对当前视频执行收藏（若已收藏则跳过）。
+     */
+    private suspend fun performCollect(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        try {
+            val node = findVideoActionNode(root, IntentKeywords.COLLECT_TEXTS, IntentKeywords.COLLECTED_TEXTS)
+            if (node == null) {
+                addLog(OperationLog.collectLog(false, "未找到收藏按钮"))
+                return false
+            }
+            val ok = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            node.recycle()
+            if (ok) {
+                collectedCount++
+                addLog(OperationLog.collectLog(true))
+            } else {
+                addLog(OperationLog.collectLog(false, "点击失败"))
+            }
+            return ok
+        } finally {
+            root.recycle()
+        }
+    }
+
+    /**
+     * 识别「当前正在播放的是哪一个视频」：拼接作者名与文案作为身份标识。
+     * 身份变化即代表刷到了新视频，触发一次分析。
+     */
+    private fun detectVideoIdentity(root: AccessibilityNodeInfo): String? {
+        val parts = mutableListOf<String>()
+        for (id in IntentKeywords.DOUYIN_VIDEO_AUTHOR_IDS) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            for (n in nodes) {
+                val t = n.text?.toString()?.trim()
+                if (!t.isNullOrEmpty()) parts.add("author:$t")
+                n.recycle()
+            }
+        }
+        for (id in IntentKeywords.DOUYIN_VIDEO_CAPTION_IDS) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            for (n in nodes) {
+                val t = n.text?.toString()?.trim()
+                if (!t.isNullOrEmpty()) parts.add("cap:${t.take(40)}")
+                n.recycle()
+            }
+        }
+        return if (parts.isEmpty()) null else parts.joinToString("|")
+    }
+
+    /**
+     * 分析当前视频并按配置决定是否点赞/收藏。
+     */
+    private suspend fun analyzeAndAct(identity: String) {
+        addLog(OperationLog.statusLog("视频分析", "正在分析视频：$identity"))
+        val result = try {
+            videoAnalyzer.analyze()
+        } catch (e: Exception) {
+            Log.e(TAG, "分析异常: ${e.message}", e)
+            addLog(OperationLog.analyzeLog("", false, false, "分析出错：${e.message}"))
+            return
+        }
+
+        analyzedCount++
+        addLog(OperationLog.analyzeLog(result.subject, result.shouldLike, result.shouldCollect, result.reason))
+        notifyStats()
+
+        val auto = prefs.autoExecuteFlow.first()
+        if (auto) {
+            if (result.shouldLike) {
+                delay(400)
+                performLike()
+                notifyStats()
+            }
+            if (result.shouldCollect) {
+                delay(400)
+                performCollect()
+                notifyStats()
+            }
+        }
+    }
+
+    /**
+     * 开始自动视频分析：循环检测当前刷到的视频，对新视频截帧分析并（可选）点赞/收藏。
+     * 适合用户手动上滑刷视频时使用；每次刷到新视频自动触发一次分析。
+     */
+    fun startVideoWatch() {
+        if (videoWatchJob?.isActive == true) {
+            addLog(OperationLog.statusLog("视频分析", "视频分析已在运行"))
+            return
+        }
+        isVideoWatching = true
+        videoWatchPaused = false
+        videoWatchJob = serviceScope.launch {
+            addLog(OperationLog.statusLog("视频分析", "开始自动分析刷到的视频"))
+            try {
+                while (isActive && isVideoWatching) {
+                    if (videoWatchPaused) {
+                        delay(500)
+                        continue
+                    }
+                    if (!prefs.analysisEnabledFlow.first()) {
+                        delay(1000)
+                        continue
+                    }
+                    if (!ScreenCaptureService.isAvailable()) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastCaptureMissingLog > 10_000) {
+                            addLog(OperationLog.statusLog("视频分析", "录屏未授权，无法分析（请先在「模型」页开启录屏）"))
+                            lastCaptureMissingLog = now
+                        }
+                        delay(5000)
+                        continue
+                    }
+                    if (isAnalyzingVideo) {
+                        delay(500)
+                        continue
+                    }
+                    val root = rootInActiveWindow
+                    if (root != null) {
+                        try {
+                            val identity = detectVideoIdentity(root)
+                            if (identity != null && identity != lastVideoIdentity) {
+                                lastVideoIdentity = identity
+                                isAnalyzingVideo = true
+                                analyzeAndAct(identity)
+                                isAnalyzingVideo = false
+                            }
+                        } finally {
+                            root.recycle()
+                        }
+                    }
+                    delay(1200)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "视频分析循环出错: ${e.message}", e)
+            } finally {
+                videoWatchJob = null
+                isVideoWatching = false
+            }
+        }
+    }
+
+    /** 暂停自动视频分析（仅在运行中有效） */
+    fun pauseVideoWatch() {
+        if (isVideoWatching && !videoWatchPaused) {
+            videoWatchPaused = true
+            addLog(OperationLog.statusLog("视频分析", "已暂停自动视频分析"))
+        }
+    }
+
+    /** 继续自动视频分析（仅在暂停中有效） */
+    fun resumeVideoWatch() {
+        if (isVideoWatching && videoWatchPaused) {
+            videoWatchPaused = false
+            addLog(OperationLog.statusLog("视频分析", "已恢复自动视频分析"))
+        }
+    }
+
+    /** 结束自动视频分析 */
+    fun stopVideoWatch() {
+        if (videoWatchJob?.isActive == true || isVideoWatching) {
+            videoWatchJob?.cancel()
+            videoWatchJob = null
+            isVideoWatching = false
+            videoWatchPaused = false
+            addLog(OperationLog.statusLog("视频分析", "已结束自动视频分析"))
+        }
+    }
+
+    /** 切换到下一个视频（尝试对可滚动节点执行向前滚动；失败则提示手动上滑） */
+    fun advanceToNextVideo() {
+        serviceScope.launch {
+            val ok = tryScrollOnce()
+            addLog(
+                OperationLog.statusLog(
+                    "下一视频",
+                    if (ok) "已尝试切换到下一个视频" else "未能自动切换（请手动上滑到下一个视频）"
+                )
+            )
         }
     }
 

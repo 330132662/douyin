@@ -13,7 +13,13 @@ enum class OperationType {
     /** 服务状态变更 */
     STATUS,
     /** 评论记录（评论内容 + 评论者昵称） */
-    COMMENT
+    COMMENT,
+    /** 视频内容分析 */
+    ANALYZE,
+    /** 点赞视频 */
+    LIKE,
+    /** 收藏视频 */
+    COLLECT
 }
 
 /**
@@ -122,6 +128,55 @@ data class OperationLog(
                 target = "服务",
                 result = status,
                 detail = detail
+            )
+        }
+
+        /**
+         * 创建一条视频内容分析日志
+         */
+        fun analyzeLog(
+            subject: String,
+            shouldLike: Boolean,
+            shouldCollect: Boolean,
+            reason: String
+        ): OperationLog {
+            val decision = buildString {
+                if (shouldLike) append("点赞")
+                if (shouldCollect) {
+                    if (isNotEmpty()) append("/")
+                    append("收藏")
+                }
+                if (isEmpty()) append("不操作")
+            }
+            return OperationLog(
+                action = OperationType.ANALYZE,
+                target = if (subject.isNotEmpty()) subject else "未知",
+                result = decision,
+                detail = reason
+            )
+        }
+
+        /**
+         * 创建一条点赞日志
+         */
+        fun likeLog(success: Boolean, reason: String = ""): OperationLog {
+            return OperationLog(
+                action = OperationType.LIKE,
+                target = "当前视频",
+                result = if (success) "成功" else "失败",
+                detail = if (reason.isNotEmpty()) reason else if (success) "已点击点赞按钮" else "点赞操作未成功"
+            )
+        }
+
+        /**
+         * 创建一条收藏日志
+         */
+        fun collectLog(success: Boolean, reason: String = ""): OperationLog {
+            return OperationLog(
+                action = OperationType.COLLECT,
+                target = "当前视频",
+                result = if (success) "成功" else "失败",
+                detail = if (reason.isNotEmpty()) reason else if (success) "已点击收藏按钮" else "收藏操作未成功"
             )
         }
     }
