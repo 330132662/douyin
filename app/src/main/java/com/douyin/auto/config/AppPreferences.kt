@@ -82,6 +82,22 @@ class AppPreferences(private val context: Context) {
         /** 截帧窗口时长（毫秒，默认 10000 = 视频前 10 秒） */
         val KEY_CAPTURE_WINDOW_MS = intPreferencesKey("capture_window_ms")
 
+        // ---- 散步模式「限速保护」配置 ----
+        /** 每日点赞/收藏操作上限（0=不限制）。用于模拟真人节奏、降低封号风险 */
+        val KEY_DAILY_ACTION_LIMIT = intPreferencesKey("daily_action_limit")
+
+        /** 切到下一个视频前的随机间隔抖动最小值（毫秒） */
+        val KEY_JITTER_MIN_MS = intPreferencesKey("jitter_min_ms")
+
+        /** 随机间隔抖动最大值（毫秒） */
+        val KEY_JITTER_MAX_MS = intPreferencesKey("jitter_max_ms")
+
+        /** 今日已执行的点赞/收藏操作数（按日期重置） */
+        val KEY_TODAY_ACTION_COUNT = intPreferencesKey("today_action_count")
+
+        /** 最后操作日期（用于重置每日计数） */
+        val KEY_LAST_ACTION_DATE = intPreferencesKey("last_action_date")
+
         // ---- 默认值 ----
         const val DEFAULT_DAILY_FOLLOW_LIMIT = 200
         const val DEFAULT_MAX_OPS_PER_SECOND = 2
@@ -93,6 +109,11 @@ class AppPreferences(private val context: Context) {
             "视频具有收藏价值：教程/干货/知识类、可复用的方法、值得回看的内容"
         const val DEFAULT_FRAME_COUNT = 3
         const val DEFAULT_CAPTURE_WINDOW_MS = 10000
+
+        // 限速保护默认值
+        const val DEFAULT_DAILY_ACTION_LIMIT = 200
+        const val DEFAULT_JITTER_MIN_MS = 2000
+        const val DEFAULT_JITTER_MAX_MS = 6000
     }
 
     // ---- 响应式数据流 ----
@@ -177,6 +198,30 @@ class AppPreferences(private val context: Context) {
     /** 截帧窗口时长 Flow */
     val captureWindowMsFlow: Flow<Int> = context.dataStore.data.map { prefs ->
         prefs[KEY_CAPTURE_WINDOW_MS] ?: DEFAULT_CAPTURE_WINDOW_MS
+    }
+
+    // ---- 限速保护 Flow ----
+
+    /** 每日点赞/收藏操作上限 Flow（0=不限制） */
+    val dailyActionLimitFlow: Flow<Int> = context.dataStore.data.map { prefs ->
+        prefs[KEY_DAILY_ACTION_LIMIT] ?: DEFAULT_DAILY_ACTION_LIMIT
+    }
+
+    /** 间隔抖动最小值 Flow */
+    val jitterMinMsFlow: Flow<Int> = context.dataStore.data.map { prefs ->
+        prefs[KEY_JITTER_MIN_MS] ?: DEFAULT_JITTER_MIN_MS
+    }
+
+    /** 间隔抖动最大值 Flow */
+    val jitterMaxMsFlow: Flow<Int> = context.dataStore.data.map { prefs ->
+        prefs[KEY_JITTER_MAX_MS] ?: DEFAULT_JITTER_MAX_MS
+    }
+
+    /** 今日已执行操作数 Flow（按日期自动重置为 0） */
+    val todayActionCountFlow: Flow<Int> = context.dataStore.data.map { prefs ->
+        val today = getCurrentDayKey()
+        val last = prefs[KEY_LAST_ACTION_DATE] ?: 0
+        if (last == today) prefs[KEY_TODAY_ACTION_COUNT] ?: 0 else 0
     }
 
     // ---- 写入方法 ----
@@ -299,6 +344,61 @@ class AppPreferences(private val context: Context) {
         context.dataStore.edit { prefs ->
             prefs[KEY_CAPTURE_WINDOW_MS] = ms.coerceIn(3000, 30000)
         }
+    }
+
+    // ---- 限速保护写入 ----
+
+    /** 设置每日操作上限（0-2000，0=不限制） */
+    suspend fun setDailyActionLimit(limit: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_DAILY_ACTION_LIMIT] = limit.coerceIn(0, 2000)
+        }
+    }
+
+    /** 设置间隔抖动最小值（>=0 毫秒） */
+    suspend fun setJitterMinMs(ms: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_JITTER_MIN_MS] = ms.coerceAtLeast(0)
+        }
+    }
+
+    /** 设置间隔抖动最大值（>=0 毫秒） */
+    suspend fun setJitterMaxMs(ms: Int) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_JITTER_MAX_MS] = ms.coerceAtLeast(0)
+        }
+    }
+
+    /**
+     * 记录一次自动点赞/收藏操作（每日计数 + 按日期重置）
+     */
+    suspend fun recordAction() {
+        context.dataStore.edit { prefs ->
+            val today = getCurrentDayKey()
+            val last = prefs[KEY_LAST_ACTION_DATE] ?: 0
+            val current = if (last == today) prefs[KEY_TODAY_ACTION_COUNT] ?: 0 else 0
+            prefs[KEY_TODAY_ACTION_COUNT] = current + 1
+            prefs[KEY_LAST_ACTION_DATE] = today
+        }
+    }
+
+    /** 读取今日已执行操作数（按日期重置） */
+    suspend fun getTodayActionCount(): Int {
+        val prefs = context.dataStore.data.first()
+        val today = getCurrentDayKey()
+        val last = prefs[KEY_LAST_ACTION_DATE] ?: 0
+        return if (last == today) prefs[KEY_TODAY_ACTION_COUNT] ?: 0 else 0
+    }
+
+    /** 是否已达到每日操作上限（limit<=0 视为不限制） */
+    suspend fun isDailyActionLimitReached(): Boolean {
+        val prefs = context.dataStore.data.first()
+        val limit = prefs[KEY_DAILY_ACTION_LIMIT] ?: DEFAULT_DAILY_ACTION_LIMIT
+        if (limit <= 0) return false
+        val today = getCurrentDayKey()
+        val last = prefs[KEY_LAST_ACTION_DATE] ?: 0
+        val count = if (last == today) prefs[KEY_TODAY_ACTION_COUNT] ?: 0 else 0
+        return count >= limit
     }
 
     /**

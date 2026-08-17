@@ -59,6 +59,9 @@ fun ModelSettingsScreen(
     var captureAvailable by remember { mutableStateOf(ScreenCaptureService.isAvailable()) }
     var testResult by remember { mutableStateOf<VideoAnalysisResult?>(null) }
     var testing by remember { mutableStateOf(false) }
+    var dailyActionLimit by remember { mutableStateOf("200") }
+    var jitterMin by remember { mutableStateOf("2000") }
+    var jitterMax by remember { mutableStateOf("6000") }
 
     // 实时反映录屏服务的真实存活状态：startForegroundService 是异步的，
     // 若服务在 onStartCommand 中崩溃，UI 不应再显示「已授权」假象。
@@ -78,6 +81,9 @@ fun ModelSettingsScreen(
     LaunchedEffect(Unit) { prefs.collectCriteriaFlow.collect { collectCriteria = it } }
     LaunchedEffect(Unit) { prefs.frameCountFlow.collect { frameCount = it.toString() } }
     LaunchedEffect(Unit) { prefs.captureWindowMsFlow.collect { captureSeconds = (it / 1000).toString() } }
+    LaunchedEffect(Unit) { prefs.dailyActionLimitFlow.collect { dailyActionLimit = it.toString() } }
+    LaunchedEffect(Unit) { prefs.jitterMinMsFlow.collect { jitterMin = it.toString() } }
+    LaunchedEffect(Unit) { prefs.jitterMaxMsFlow.collect { jitterMax = it.toString() } }
 
     val captureLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -198,6 +204,39 @@ fun ModelSettingsScreen(
                     captureSeconds = it
                     it.toIntOrNull()?.let { v -> scope.launch { prefs.setCaptureWindowMs(v * 1000) } }
                 }
+            }
+
+            item { Divider() }
+            item { SectionTitle("限速保护（模拟真人 · 降封号风险）") }
+            item {
+                LabeledTextField("每日点赞/收藏上限 (0=不限制)", dailyActionLimit, "如 200", keyboardNumeric = true) {
+                    dailyActionLimit = it
+                    it.toIntOrNull()?.let { v -> scope.launch { prefs.setDailyActionLimit(v) } }
+                }
+                Text(
+                    "达到上限后自动停止散步模式。设为 0 表示不限（不推荐）。默认 200 已接近重度用户量级，仍有上限保护。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
+            }
+            item {
+                LabeledTextField("间隔抖动最小值(毫秒)", jitterMin, "如 2000", keyboardNumeric = true) {
+                    jitterMin = it
+                    it.toIntOrNull()?.let { v -> scope.launch { prefs.setJitterMinMs(v) } }
+                }
+            }
+            item {
+                LabeledTextField("间隔抖动最大值(毫秒)", jitterMax, "如 6000", keyboardNumeric = true) {
+                    jitterMax = it
+                    it.toIntOrNull()?.let { v -> scope.launch { prefs.setJitterMaxMs(v) } }
+                }
+                Text(
+                    "每次切到下一个视频前，在基础 2.6 秒之上随机追加 min~max 毫秒等待，打破固定节奏。建议 max 明显大于 min。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
             }
 
             item { Divider() }

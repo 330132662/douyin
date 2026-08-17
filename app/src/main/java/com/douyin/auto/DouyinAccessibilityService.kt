@@ -33,6 +33,7 @@ import android.view.WindowManager
 import android.widget.TextView
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+import kotlin.random.Random
 
 /**
  * 抖音无障碍服务 - 核心服务
@@ -666,22 +667,39 @@ class DouyinAccessibilityService : AccessibilityService() {
         notifyStats()
 
         val auto = prefs.autoExecuteFlow.first()
+        val limitReached = prefs.isDailyActionLimitReached()
         var didLike = false
         var didCollect = false
-        if (auto) {
+        if (auto && !limitReached) {
             if (result.shouldLike) {
                 delay(400)
                 didLike = performLike()
-                notifyStats()
+                if (didLike) {
+                    prefs.recordAction()
+                    notifyStats()
+                }
             }
             if (result.shouldCollect) {
                 delay(400)
                 didCollect = performCollect()
-                notifyStats()
+                if (didCollect) {
+                    prefs.recordAction()
+                    notifyStats()
+                }
             }
         }
         // 提示用户本视频的决策结果
-        notifyUser(buildDecisionMessage(result, auto, didLike, didCollect))
+        notifyUser(buildDecisionMessage(result, auto, didLike, didCollect, limitReached))
+        // 若已达到每日操作上限，停止自动操作并结束散步模式（避免空转与风控）
+        if (auto && limitReached) {
+            addLog(
+                OperationLog.statusLog(
+                    "散步模式", "今日点赞/收藏已达上限（${prefs.getTodayActionCount()}），自动结束散步模式"
+                )
+            )
+            notifyUser("今日点赞/收藏已达上限（${prefs.getTodayActionCount()}），已自动停止散步模式")
+            stopVideoWatch()
+        }
     }
 
     /** 根据分析结果拼装给用户的提示文案 */
@@ -689,7 +707,8 @@ class DouyinAccessibilityService : AccessibilityService() {
         result: com.douyin.auto.model.VideoAnalysisResult,
         auto: Boolean,
         didLike: Boolean,
-        didCollect: Boolean
+        didCollect: Boolean,
+        limitReached: Boolean = false
     ): String {
         val subj = result.subject.ifEmpty { "（无主体）" }
         val action = buildString {
@@ -713,6 +732,10 @@ class DouyinAccessibilityService : AccessibilityService() {
                 )
             }
             if (isEmpty()) append("已跳过（不符合条件）")
+            if (limitReached) {
+                if (isNotEmpty()) append(" · ")
+                append("（已达今日上限）")
+            }
         }
         return "视频：$subj\n$action"
     }
@@ -775,7 +798,11 @@ class DouyinAccessibilityService : AccessibilityService() {
                                 isAnalyzingVideo = false
                                 advanceToNextVideo()
                                 lastAdvanceTime = System.currentTimeMillis()
-                                delay(2600) // 等待下一个视频加载并播放
+                                // 随机间隔抖动：模拟真人看完视频后的自然停顿，打破规律节奏，降低风控命中
+                                val jMin = prefs.jitterMinMsFlow.first()
+                                val jMax = prefs.jitterMaxMsFlow.first()
+                                val jitter = if (jMax > jMin) Random.nextLong(jMin.toLong(), jMax.toLong()) else jMin.toLong()
+                                delay(2600 + jitter)
                             } else {
                                 // 仍是同一个视频：若切换失败则定时重试，否则稍后再看
                                 if (lastVideoIdentity != null && System.currentTimeMillis() - lastAdvanceTime > 6000) {
