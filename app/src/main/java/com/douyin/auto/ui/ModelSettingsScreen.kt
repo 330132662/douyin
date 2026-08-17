@@ -60,6 +60,15 @@ fun ModelSettingsScreen(
     var testResult by remember { mutableStateOf<VideoAnalysisResult?>(null) }
     var testing by remember { mutableStateOf(false) }
 
+    // 实时反映录屏服务的真实存活状态：startForegroundService 是异步的，
+    // 若服务在 onStartCommand 中崩溃，UI 不应再显示「已授权」假象。
+    LaunchedEffect(Unit) {
+        while (true) {
+            captureAvailable = ScreenCaptureService.isAvailable()
+            kotlinx.coroutines.delay(1500)
+        }
+    }
+
     LaunchedEffect(Unit) { prefs.apiBaseUrlFlow.collect { apiBaseUrl = it } }
     LaunchedEffect(Unit) { prefs.apiKeyFlow.collect { apiKey = it } }
     LaunchedEffect(Unit) { prefs.modelNameFlow.collect { modelName = it } }
@@ -72,16 +81,16 @@ fun ModelSettingsScreen(
 
     val captureLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
-    ) { res ->
-        if (res.resultCode == ComponentActivity.RESULT_OK && res.data != null) {
-            val intent = Intent(context, ScreenCaptureService::class.java).apply {
-                putExtra("resultCode", res.resultCode)
-                putExtra("data", res.data)
+        ) { res ->
+            if (res.resultCode == ComponentActivity.RESULT_OK && res.data != null) {
+                val intent = Intent(context, ScreenCaptureService::class.java).apply {
+                    putExtra("resultCode", res.resultCode)
+                    putExtra("data", res.data)
+                }
+                // 启动录屏服务；是否真正「已授权」由上面的实时轮询反映，避免假象
+                ContextCompat.startForegroundService(context, intent)
             }
-            ContextCompat.startForegroundService(context, intent)
-            captureAvailable = true
         }
-    }
 
     fun requestCapture() {
         val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -204,7 +213,7 @@ fun ModelSettingsScreen(
                     Text(if (captureAvailable) "重新授权录屏" else "开启录屏授权")
                 }
                 Text(
-                    text = if (captureAvailable) "✔ 录屏已授权，可截取抖音画面" else "⚠ 未授权：视频分析需要系统录屏权限才能截帧",
+                    text = if (captureAvailable) "✔ 录屏服务运行中，可截取抖音画面" else "⚠ 录屏服务未运行：请点上方按钮授权；若已授权仍显示此状态，说明服务启动失败，请用「adb logcat -s ScreenCaptureService」查看失败原因",
                     style = MaterialTheme.typography.bodySmall,
                     color = if (captureAvailable) StatusGreen else StatusRed,
                     modifier = Modifier.padding(top = 6.dp)
@@ -213,12 +222,16 @@ fun ModelSettingsScreen(
             item {
                 Button(
                     onClick = {
+                        if (ScreenCaptureService.instance == null) {
+                            testResult = VideoAnalysisResult(raw = "", reason = "录屏服务未运行，无法截帧。请先在上方授权录屏并确保「录屏服务运行中」。")
+                            return@Button
+                        }
                         testing = true
                         scope.launch {
                             try {
                                 val frame = withContext(Dispatchers.IO) { ScreenCaptureService.instance?.captureFrameJpeg() }
                                 testResult = if (frame == null) {
-                                    VideoAnalysisResult(raw = "", reason = "截帧失败：请先授权录屏并播放抖音视频")
+                                    VideoAnalysisResult(raw = "", reason = "截帧失败：录屏服务在运行但拿不到帧（请确认抖音正在播放视频，且 App 未退到后台）")
                                 } else {
                                     withContext(Dispatchers.IO) {
                                         LlmClient(apiBaseUrl, apiKey, modelName)

@@ -1,5 +1,6 @@
 package com.douyin.auto.media
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -19,6 +20,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.douyin.auto.R
 
 /**
  * 系统级录屏服务（MediaProjection）。
@@ -59,35 +61,50 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
-        val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent?.getParcelableExtra("data", Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent?.getParcelableExtra("data")
-        }
+        try {
+            val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
+            val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent?.getParcelableExtra("data", Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent?.getParcelableExtra("data")
+            }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIF_ID,
-                buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
-        } else {
-            startForeground(NOTIF_ID, buildNotification())
-        }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIF_ID,
+                    buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIF_ID, buildNotification())
+            }
 
-        if (resultCode == -1 || data == null) {
-            Log.e(TAG, "缺少录屏授权数据，停止服务")
-            stopSelf()
+            // 注意：Activity.RESULT_OK 的值就是 -1（表示授权成功），RESULT_CANCELED 才是 0
+            if (resultCode != Activity.RESULT_OK || data == null) {
+                Log.e(TAG, "录屏授权被取消或缺少数据(resultCode=$resultCode)，停止服务")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+
+            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = mgr.getMediaProjection(resultCode, data)
+            // Android 10+：录制方 App 退到后台时系统会停止录屏；监听以便正确清理状态
+            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.w(TAG, "MediaProjection 已被系统停止（App 退到后台 / 用户停止录屏）")
+                    stopSelf()
+                }
+            }, handler)
+            setupVirtualDisplay()
+            instance = this
+            Log.i(TAG, "录屏服务启动成功，可以截帧")
+            return START_NOT_STICKY
+        } catch (e: Exception) {
+            Log.e(TAG, "录屏服务启动失败: ${e.javaClass.simpleName}: ${e.message}", e)
+            runCatching { stopSelf() }
             return START_NOT_STICKY
         }
-
-        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = mgr.getMediaProjection(resultCode, data)
-        setupVirtualDisplay()
-        instance = this
-        return START_NOT_STICKY
     }
 
     private fun setupVirtualDisplay() {
@@ -178,7 +195,7 @@ class ScreenCaptureService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("视频分析录屏中")
             .setContentText("正在截取抖音视频画面用于内容分析")
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setSmallIcon(R.mipmap.ic_launcher)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }

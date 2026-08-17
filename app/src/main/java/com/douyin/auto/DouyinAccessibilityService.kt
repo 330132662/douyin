@@ -21,6 +21,7 @@ import com.douyin.auto.service.CommentScanner
 import com.douyin.auto.service.VideoContentAnalyzer
 import com.douyin.auto.ui.FloatingAction
 import com.douyin.auto.ui.FloatingDotManager
+import com.douyin.auto.ui.KeepAliveActivity
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 
@@ -123,6 +124,10 @@ class DouyinAccessibilityService : AccessibilityService() {
 
     /** 录屏缺失日志节流时间戳 */
     private var lastCaptureMissingLog: Long = 0L
+
+    /** 保活 Activity 是否已启动（视频分析进行时保持 App 前台，避免系统停止录屏） */
+    @Volatile
+    private var keepAliveStarted: Boolean = false
 
     @Volatile
     private var isProcessing: Boolean = false
@@ -664,6 +669,7 @@ class DouyinAccessibilityService : AccessibilityService() {
                         continue
                     }
                     if (!ScreenCaptureService.isAvailable()) {
+                        if (keepAliveStarted) stopKeepAlive()
                         val now = System.currentTimeMillis()
                         if (now - lastCaptureMissingLog > 10_000) {
                             addLog(OperationLog.statusLog("视频分析", "录屏未授权，无法分析（请先在「模型」页开启录屏）"))
@@ -672,6 +678,8 @@ class DouyinAccessibilityService : AccessibilityService() {
                         delay(5000)
                         continue
                     }
+                    // 已授权：确保保活 Activity 在运行（切到抖音后 App 退后台会被系统停止录屏）
+                    if (!keepAliveStarted) startKeepAlive()
                     if (isAnalyzingVideo) {
                         delay(500)
                         continue
@@ -724,7 +732,29 @@ class DouyinAccessibilityService : AccessibilityService() {
             videoWatchJob = null
             isVideoWatching = false
             videoWatchPaused = false
+            stopKeepAlive()
             addLog(OperationLog.statusLog("视频分析", "已结束自动视频分析"))
+        }
+    }
+
+    /** 启动透明保活 Activity，使本 App 保持前台，避免切到抖音后系统停止 MediaProjection 录屏 */
+    private fun startKeepAlive() {
+        try {
+            val intent = Intent(this, KeepAliveActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            keepAliveStarted = true
+        } catch (e: Exception) {
+            Log.w(TAG, "启动保活 Activity 失败: ${e.message}")
+        }
+    }
+
+    /** 关闭保活 Activity（视频分析停止时调用） */
+    private fun stopKeepAlive() {
+        if (keepAliveStarted) {
+            applicationContext.sendBroadcast(Intent(KeepAliveActivity.ACTION_STOP_KEEPALIVE))
+            keepAliveStarted = false
         }
     }
 
