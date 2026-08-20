@@ -1,11 +1,5 @@
 package com.douyin.auto.ui
 
-import android.content.Context
-import android.content.Intent
-import android.media.projection.MediaProjectionManager
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,7 +16,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import com.douyin.auto.config.AppPreferences
 import com.douyin.auto.media.ScreenCaptureService
 import com.douyin.auto.model.VideoAnalysisResult
@@ -56,21 +49,11 @@ fun ModelSettingsScreen(
     var collectCriteria by remember { mutableStateOf("") }
     var frameCount by remember { mutableStateOf("3") }
     var captureSeconds by remember { mutableStateOf("10") }
-    var captureAvailable by remember { mutableStateOf(ScreenCaptureService.isAvailable()) }
     var testResult by remember { mutableStateOf<VideoAnalysisResult?>(null) }
     var testing by remember { mutableStateOf(false) }
     var dailyActionLimit by remember { mutableStateOf("200") }
     var jitterMin by remember { mutableStateOf("2000") }
     var jitterMax by remember { mutableStateOf("6000") }
-
-    // 实时反映录屏服务的真实存活状态：startForegroundService 是异步的，
-    // 若服务在 onStartCommand 中崩溃，UI 不应再显示「已授权」假象。
-    LaunchedEffect(Unit) {
-        while (true) {
-            captureAvailable = ScreenCaptureService.isAvailable()
-            kotlinx.coroutines.delay(1500)
-        }
-    }
 
     LaunchedEffect(Unit) { prefs.apiBaseUrlFlow.collect { apiBaseUrl = it } }
     LaunchedEffect(Unit) { prefs.apiKeyFlow.collect { apiKey = it } }
@@ -84,24 +67,6 @@ fun ModelSettingsScreen(
     LaunchedEffect(Unit) { prefs.dailyActionLimitFlow.collect { dailyActionLimit = it.toString() } }
     LaunchedEffect(Unit) { prefs.jitterMinMsFlow.collect { jitterMin = it.toString() } }
     LaunchedEffect(Unit) { prefs.jitterMaxMsFlow.collect { jitterMax = it.toString() } }
-
-    val captureLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-        ) { res ->
-            if (res.resultCode == ComponentActivity.RESULT_OK && res.data != null) {
-                val intent = Intent(context, ScreenCaptureService::class.java).apply {
-                    putExtra("resultCode", res.resultCode)
-                    putExtra("data", res.data)
-                }
-                // 启动录屏服务；是否真正「已授权」由上面的实时轮询反映，避免假象
-                ContextCompat.startForegroundService(context, intent)
-            }
-        }
-
-    fun requestCapture() {
-        val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        captureLauncher.launch(mgr.createScreenCaptureIntent())
-    }
 
     Scaffold(
         topBar = {
@@ -240,29 +205,19 @@ fun ModelSettingsScreen(
             }
 
             item { Divider() }
-            item { SectionTitle("录屏授权（截帧必需）") }
+            item { SectionTitle("视频分析测试") }
             item {
-                OutlinedButton(
-                    onClick = { requestCapture() },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(Icons.Default.Videocam, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (captureAvailable) "重新授权录屏" else "开启录屏授权")
-                }
                 Text(
-                    text = if (captureAvailable) "✔ 录屏服务运行中，可截取抖音画面" else "⚠ 录屏服务未运行：请点上方按钮授权；若已授权仍显示此状态，说明服务启动失败，请用「adb logcat -s ScreenCaptureService」查看失败原因",
+                    "录屏授权已移至首页：请先在首页「录屏授权」卡片完成授权，并确保状态显示「录屏服务运行中」后再测试。",
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (captureAvailable) StatusGreen else StatusRed,
-                    modifier = Modifier.padding(top = 6.dp)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             item {
                 Button(
                     onClick = {
                         if (ScreenCaptureService.instance == null) {
-                            testResult = VideoAnalysisResult(raw = "", reason = "录屏服务未运行，无法截帧。请先在上方授权录屏并确保「录屏服务运行中」。")
+                            testResult = VideoAnalysisResult(raw = "", reason = "录屏服务未运行，无法截帧。请先在首页授权录屏并确保「录屏服务运行中」。")
                             return@Button
                         }
                         testing = true

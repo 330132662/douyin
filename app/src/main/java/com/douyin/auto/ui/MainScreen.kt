@@ -1,7 +1,12 @@
 package com.douyin.auto.ui
 
+import android.content.Context
 import android.content.Intent
+import android.media.projection.MediaProjectionManager
 import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -20,11 +25,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.douyin.auto.DouyinAccessibilityService
 import com.douyin.auto.Page
+import com.douyin.auto.media.ScreenCaptureService
 import com.douyin.auto.ui.theme.*
 
 /**
@@ -150,6 +156,11 @@ fun MainScreen(
 
             // ---- 今日统计卡片 ----
             StatsCard(stats = stats)
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // ---- 录屏授权（视频分析截帧必需，从「模型」页迁入）----
+            ScreenCaptureAuthCard()
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -535,6 +546,90 @@ private fun CopyrightNoticeBanner(onClick: () -> Unit) {
                 Icons.Default.ChevronRight,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onPrimary
+            )
+        }
+    }
+}
+
+/**
+ * 录屏授权卡片（视频内容分析截帧必需）
+ *
+ * 发起系统 MediaProjection 录屏授权并启动 [ScreenCaptureService]，
+ * 实时反映录屏服务存活状态。从「模型」页迁至首页，便于用户在首屏完成授权。
+ */
+@Composable
+private fun ScreenCaptureAuthCard() {
+    val context = LocalContext.current
+    var captureAvailable by remember { mutableStateOf(ScreenCaptureService.isAvailable()) }
+
+    // 实时反映录屏服务真实存活状态：startForegroundService 是异步的，
+    // 若服务在 onStartCommand 中崩溃，UI 不应再显示「已授权」假象。
+    LaunchedEffect(Unit) {
+        while (true) {
+            captureAvailable = ScreenCaptureService.isAvailable()
+            kotlinx.coroutines.delay(1500)
+        }
+    }
+
+    val captureLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        if (res.resultCode == ComponentActivity.RESULT_OK && res.data != null) {
+            val intent = Intent(context, ScreenCaptureService::class.java).apply {
+                putExtra("resultCode", res.resultCode)
+                putExtra("data", res.data)
+            }
+            ContextCompat.startForegroundService(context, intent)
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Videocam,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "录屏授权（视频分析截帧必需）",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedButton(
+                onClick = {
+                    val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    captureLauncher.launch(mgr.createScreenCaptureIntent())
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.Videocam, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text(if (captureAvailable) "重新授权录屏" else "开启录屏授权")
+            }
+
+            Text(
+                text = if (captureAvailable) "✔ 录屏服务运行中，可截取抖音画面"
+                       else "⚠ 录屏服务未运行：点上方按钮授权；若已授权仍显示此状态，说明服务启动失败，请用「adb logcat -s ScreenCaptureService」查看失败原因",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (captureAvailable) StatusGreen else StatusRed,
+                modifier = Modifier.padding(top = 8.dp)
             )
         }
     }

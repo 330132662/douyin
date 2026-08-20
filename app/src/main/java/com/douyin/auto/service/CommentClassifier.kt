@@ -27,7 +27,7 @@ class CommentClassifier(
     fun updateKeywords(intentKeywords: Set<String>, adKeywords: Set<String>) {
         this.customIntentKeywords = intentKeywords
         this.customAdKeywords = adKeywords
-        Log.d(TAG, "关键词已更新 - 意向: ${intentKeywords.size} 个, 广告: ${adKeywords.size} 个")
+//        Log.d(TAG, "关键词已更新 - 意向: ${intentKeywords.size} 个, 广告: ${adKeywords.size} 个")
     }
 
     /**

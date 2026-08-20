@@ -233,10 +233,10 @@ class DouyinAccessibilityService : AccessibilityService() {
             while (isActive) {
                 delay(20000L)
                 commentClassifier.updateKeywords(currentIntentKeywords, currentAdKeywords)
-                Log.d(
+                /*Log.d(
                     TAG,
                     "关键词配置已同步: 意向${currentIntentKeywords.size}个, 广告${currentAdKeywords.size}个"
-                )
+                )*/
             }
 
             intentJob.cancel()
@@ -647,6 +647,7 @@ class DouyinAccessibilityService : AccessibilityService() {
         }
 
         data class Hit(val node: AccessibilityNodeInfo, val cx: Int, val cy: Int, val label: String)
+
         val hits = ArrayList<Hit>()
         for (n in all) {
             val r = Rect()
@@ -925,12 +926,28 @@ class DouyinAccessibilityService : AccessibilityService() {
     /** 直播间检测（预览卡片或已进入直播间均适用），不依赖大模型。 */
     private data class LiveDetectResult(val isLive: Boolean, val reason: String)
 
+    /**
+     * 判断节点是否真正落在屏幕可视区域内（不仅是 VISIBLE 标志为真）。
+     * 部分国产 ROM（MIUI/EMUI/ColorOS 等）下，被滑出屏幕但仍挂载的节点
+     * [AccessibilityNodeInfo.isVisibleToUser] 仍可能返回 true，因此再用
+     * boundsInScreen 与屏幕矩形做相交校验，过滤掉「逻辑可见但肉眼不可见」的残留节点。
+     */
+    private fun isOnScreen(node: AccessibilityNodeInfo): Boolean {
+        val dm = resources.displayMetrics
+        val screen = Rect(0, 0, dm.widthPixels, dm.heightPixels)
+        val b = Rect()
+        node.getBoundsInScreen(b)   // 老版本无 boundsInScreen 无参属性（API 33+），用 getBoundsInScreen(Rect) 兼容
+        return b.width() > 0 && b.height() > 0 && Rect.intersects(screen, b)
+    }
+
     /** 直播跳过标记：避免同一张直播预览卡片在循环里被反复判定为“新视频”。 */
     private val LIVE_SKIP_MARKER = "__live_room_skipped__"
 
     /**
      * 检测当前屏幕是否为直播间/直播预览。纯无障碍节点文本扫描，**不调用大模型**。
-     * 命中 [IntentKeywords.LIVE_TEXTS] 任一特征文本（含 EditText 的 hintText）即判定为直播。
+     * 强信号：仅当用户可见、且确实落在屏幕可视区域内的「点击进入直播间」CTA 出现时，
+     * 才判定为直播预览卡片（见 [IntentKeywords.LIVE_CTA_TEXTS]）。
+     * 以「是否对用户可见 + 边界相交」双重约束替代裸 "直播" 子串匹配，避免「直播广场」等误命中。
      */
     private fun detectLiveStream(root: AccessibilityNodeInfo): LiveDetectResult {
         val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
@@ -940,16 +957,20 @@ class DouyinAccessibilityService : AccessibilityService() {
             val node = queue.removeFirst()
             val isRoot = node == root
             val text = node.text?.toString() ?: ""
+            val visible = node.isVisibleToUser
             val desc = node.contentDescription?.toString() ?: ""
             val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 node.hintText?.toString() ?: ""
             } else ""
             val id = node.viewIdResourceName ?: ""
             val label = (text + " " + desc + " " + hint + " " + id).lowercase()
-            if (hitText == null && IntentKeywords.LIVE_TEXTS.any { it.lowercase() in label }) {
+            // 强信号：仅当「点击进入直播间」CTA 对用户可见、且确实落在屏幕可视区域内，才判定为直播预览卡片
+            if (hitText == null && visible && isOnScreen(node) &&
+                IntentKeywords.LIVE_CTA_TEXTS.any { it.lowercase() in label }
+            ) {
                 hitText = text.ifBlank { desc.ifBlank { hint.ifBlank { id } } }
             }
-            if (!weak && listOf("直播", "live", "进入直播间", "说点", "礼物", "粉丝")
+            if (!weak && listOf("进入直播间")
                     .any { it in label }
             ) {
                 weak = true
@@ -995,7 +1016,7 @@ class DouyinAccessibilityService : AccessibilityService() {
                 hasPreviewCta = true
             }
             if (!hasLiveChat && (node.isEditable ||
-                    node.className?.toString()?.contains("EditText") == true)
+                        node.className?.toString()?.contains("EditText") == true)
             ) {
                 if (chatHints.any { it in (hint + " " + text) }) {
                     hasLiveChat = true
@@ -1022,7 +1043,7 @@ class DouyinAccessibilityService : AccessibilityService() {
                             "散步模式", "检测到直播（${live.reason}），跳过分析（不调用大模型）"
                         )
                     )
-                    notifyUser("检测到直播，已跳过")
+                    notifyUser("检测到直播，已跳过 1")
                     return
                 }
             } finally {
@@ -1200,7 +1221,7 @@ class DouyinAccessibilityService : AccessibilityService() {
                                             "散步模式", "检测到直播预览（${live.reason}），跳过"
                                         )
                                     )
-                                    notifyUser("检测到直播，已跳过")
+                                    notifyUser("检测到直播，已跳过 2")
                                     lastVideoIdentity = LIVE_SKIP_MARKER
                                     advanceToNextVideo()
                                     lastAdvanceTime = System.currentTimeMillis()

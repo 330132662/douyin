@@ -126,6 +126,10 @@ object IntentKeywords {
         "直播中", "正在直播", "直播", "live"
     )
 
+    /** 直播预览卡片强信号：仅当用户可见的「点击进入直播间」CTA 出现时才判定为直播预览，
+     *  用于替代裸 "直播" 子串匹配，避免「直播广场」等文字误命中。 */
+    val LIVE_CTA_TEXTS: List<String> = listOf("点击进入直播间")
+
     /** 评论页面特征文本（用于判断当前是否在评论区） */
     val COMMENT_PAGE_TEXTS: List<String> = listOf(
         "评论", "共", "条评论", "回复"
