@@ -26,11 +26,14 @@ import com.douyin.auto.ui.KeepAliveActivity
 import android.accessibilityservice.GestureDescription
 import android.graphics.Color
 import android.graphics.Path
+import android.graphics.Point
+import android.graphics.Rect
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.TextView
+import android.widget.Toast
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlin.random.Random
@@ -78,6 +81,22 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         /** 日志监听器 */
         var logListener: ((OperationLog) -> Unit)? = null
+
+        // ---- 双击点赞相关常量 ----
+        /** 双击选点时禁区外扩边距（dp），降低擦边误触可点击元素的概率 */
+        private const val SAFE_MARGIN_DP = 10
+
+        /** 选点保持距视频区域边缘的内边距（dp） */
+        private const val SAFE_POINT_PAD_DP = 24
+
+        /** 安全选点最大重试次数 */
+        private const val SAFE_POINT_TRIES = 50
+
+        /** 双击单点按下的时长（ms） */
+        private const val DOUBLE_TAP_DURATION_MS = 60L
+
+        /** 双击两次点按之间的间隔（ms），合计需 < 系统双击阈值(约300ms) */
+        private const val DOUBLE_TAP_GAP_MS = 90L
     }
 
     // ---- 核心组件 ----
@@ -197,8 +216,8 @@ class DouyinAccessibilityService : AccessibilityService() {
         info.notificationTimeout = 100
         info.flags =
             AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-            AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-            AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE
+                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                    AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE
         setServiceInfo(info)
 
         // 加载用户自定义关键词（使用 combine 避免嵌套 collect 死锁）
@@ -212,7 +231,7 @@ class DouyinAccessibilityService : AccessibilityService() {
 
             // 每 2 秒检查一次并更新分类器
             while (isActive) {
-                delay(2000L)
+                delay(20000L)
                 commentClassifier.updateKeywords(currentIntentKeywords, currentAdKeywords)
                 Log.d(
                     TAG,
@@ -231,15 +250,16 @@ class DouyinAccessibilityService : AccessibilityService() {
         floatingDot = FloatingDotManager(
             context = this, actions = listOf(
                 FloatingAction("开始翻页") { startPageFlip() },
-            FloatingAction("暂停翻页") { pausePageFlip() },
-            FloatingAction("继续翻页") { resumePageFlip() },
-            FloatingAction("结束翻页") { stopPageFlip() },
-            FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) },
-            FloatingAction("开始散步模式") { startVideoWatch() },
-            FloatingAction("暂停散步") { pauseVideoWatch() },
-            FloatingAction("继续散步") { resumeVideoWatch() },
-            FloatingAction("结束散步") { stopVideoWatch() },
-            FloatingAction("下一视频(手动)") { advanceToNextVideo() })).also { it.show() }
+                FloatingAction("暂停翻页") { pausePageFlip() },
+                FloatingAction("继续翻页") { resumePageFlip() },
+                FloatingAction("结束翻页") { stopPageFlip() },
+                FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) },
+                FloatingAction("开始散步模式") { startVideoWatch() },
+                FloatingAction("暂停散步") { pauseVideoWatch() },
+                FloatingAction("继续散步") { resumeVideoWatch() },
+                FloatingAction("结束散步") { stopVideoWatch() },
+                FloatingAction("下一视频(手动)") { advanceToNextVideo() })
+        ).also { it.show() }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -567,30 +587,158 @@ class DouyinAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 对当前视频执行点赞（若已点赞则跳过）。
+     * 对当前视频执行点赞（在视频区域随机选点双击；若已点赞则跳过以免取消赞）。
+     *
+     * 流程：
+     * 1. 单次遍历无障碍节点树，定位视频区域（优先视频渲染表面）、判断是否已赞、收集所有可点击禁区；
+     * 2. 在视频区域内随机取点，避开禁区（已外扩安全边距）；
+     * 3. 在该点下发「双击」手势 —— 抖音双击视频即点赞，且不会误触右侧点赞/评论/分享/头像等按钮。
      */
     private suspend fun performLike(): Boolean {
         val root = rootInActiveWindow ?: return false
         try {
-            val node =
-                findVideoActionNode(root, IntentKeywords.LIKE_TEXTS, IntentKeywords.LIKED_TEXTS)
-            if (node == null) {
-                addLog(OperationLog.likeLog(false, "未找到点赞按钮"))
+            val ctx = analyzeVideoForLike(root)
+
+            // 已点赞则跳过：二次双击会触发「取消赞」，必须避免
+            if (ctx.alreadyLiked) {
+                addLog(OperationLog.likeLog(false, "已点赞，跳过（双击会取消赞）"))
                 return false
             }
-            val ok = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            node.recycle()
+
+            val point = pickSafeDoubleTapPoint(ctx.videoArea, ctx.clickableRects)
+            val ok = dispatchDoubleTap(point.x, point.y)
             if (ok) {
                 likedCount++
-                addLog(OperationLog.likeLog(true))
+                addLog(OperationLog.likeLog(true, "视频区域双击点赞 @(${point.x},${point.y})"))
             } else {
-                addLog(OperationLog.likeLog(false, "点击失败"))
+                addLog(OperationLog.likeLog(false, "双击失败（请检查无障碍「执行手势」权限）"))
             }
             return ok
         } finally {
             root.recycle()
         }
     }
+
+    /**
+     * 单次遍历节点树，收集双击点赞所需的上下文：
+     * - [VideoLikeContext.videoArea] 视频区域（屏幕坐标）：优先取视频渲染表面
+     *   TextureView/SurfaceView/VideoView 的范围；取不到则回退为整屏去掉安全边距。
+     * - [VideoLikeContext.alreadyLiked] 是否已点赞（命中 [IntentKeywords.LIKED_TEXTS]）。
+     * - [VideoLikeContext.clickableRects] 视频区域内所有可点击节点的屏幕矩形（已外扩 [SAFE_MARGIN_DP]），
+     *   双击选点时需避开，防止误触其它功能。
+     */
+    private fun analyzeVideoForLike(root: AccessibilityNodeInfo): VideoLikeContext {
+        val dm = resources.displayMetrics
+        var surface: Rect? = null
+        var surfaceArea = 0
+        var alreadyLiked = false
+        val clickableRects = ArrayList<Rect>()
+        val margin = (SAFE_MARGIN_DP * dm.density).toInt().coerceAtLeast(8)
+
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var isRoot = true
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            // 视频渲染表面
+            val cn = node.className?.toString() ?: ""
+            if (cn.contains("TextureView") || cn.contains("SurfaceView") || cn.contains("VideoView")) {
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                val area = r.width() * r.height()
+                if (area > surfaceArea) {
+                    surfaceArea = area
+                    surface = r
+                }
+            }
+            // 已点赞判定
+            if (!alreadyLiked) {
+                val label = buildString {
+                    append(node.text?.toString() ?: "")
+                    append(" ")
+                    append(node.contentDescription?.toString() ?: "")
+                }.lowercase()
+                if (IntentKeywords.LIKED_TEXTS.any { it.lowercase() in label }) alreadyLiked = true
+            }
+            // 可点击节点 → 禁区（外扩安全边距，降低擦边误触概率）
+            if (node.isClickable) {
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                r.inset(-margin, -margin)
+                clickableRects.add(r)
+            }
+            repeat(node.childCount) { i -> node.getChild(i)?.let { queue.add(it) } }
+            if (!isRoot) node.recycle()
+            isRoot = false
+        }
+
+        val videoArea: Rect =
+            if (surface != null && surface!!.width() > 0 && surface!!.height() > 0) {
+                surface!!
+            } else {
+                val topInset = (dm.heightPixels * 0.05f).toInt()
+                val bottomInset = (dm.heightPixels * 0.12f).toInt()
+                val rightInset = (dm.widthPixels * 0.14f).toInt()
+                val leftInset = (dm.widthPixels * 0.03f).toInt()
+                Rect(
+                    leftInset,
+                    topInset,
+                    dm.widthPixels - rightInset,
+                    dm.heightPixels - bottomInset
+                )
+            }
+        // 仅保留与视频区域相交的禁区
+        val forbidden = clickableRects.filter { Rect.intersects(videoArea, it) }
+        return VideoLikeContext(videoArea, alreadyLiked, forbidden)
+    }
+
+    /**
+     * 在视频区域内随机取点，避开 [forbidden] 禁区。
+     * 多次重试仍失败则回退到区域几何中心（主 Feed 中心通常为纯视频，无点击元素）。
+     */
+    private fun pickSafeDoubleTapPoint(area: Rect, forbidden: List<Rect>): Point {
+        val pad = (SAFE_POINT_PAD_DP * resources.displayMetrics.density).toInt().coerceAtLeast(16)
+        val minX = area.left + pad
+        val maxX = area.right - pad
+        val minY = area.top + pad
+        val maxY = area.bottom - pad
+        if (maxX > minX && maxY > minY) {
+            repeat(SAFE_POINT_TRIES) {
+                val x = Random.nextInt(minX, maxX)
+                val y = Random.nextInt(minY, maxY)
+                if (forbidden.none { it.contains(x, y) }) {
+                    return Point(x, y)
+                }
+            }
+        }
+        return Point(area.centerX(), area.centerY())
+    }
+
+    /**
+     * 在指定屏幕坐标下发「双击」手势：两次短促点按，间隔 [DOUBLE_TAP_GAP_MS]，
+     * 以被抖音识别为双击点赞，而非两次独立单击。
+     */
+    private fun dispatchDoubleTap(x: Int, y: Int): Boolean {
+        val fx = x.toFloat()
+        val fy = y.toFloat()
+        val tapDuration = DOUBLE_TAP_DURATION_MS
+        val gap = DOUBLE_TAP_GAP_MS
+        val stroke1 = GestureDescription.StrokeDescription(
+            Path().apply { moveTo(fx, fy) }, 0, tapDuration
+        )
+        val stroke2 = GestureDescription.StrokeDescription(
+            Path().apply { moveTo(fx, fy) }, tapDuration + gap, tapDuration
+        )
+        val gesture = GestureDescription.Builder().addStroke(stroke1).addStroke(stroke2).build()
+        return runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
+    }
+
+    /** 双击点赞所需的视频上下文 */
+    private data class VideoLikeContext(
+        val videoArea: Rect,
+        val alreadyLiked: Boolean,
+        val clickableRects: List<Rect>
+    )
 
     /**
      * 对当前视频执行收藏（若已收藏则跳过）。
@@ -694,7 +842,8 @@ class DouyinAccessibilityService : AccessibilityService() {
         if (auto && limitReached) {
             addLog(
                 OperationLog.statusLog(
-                    "散步模式", "今日点赞/收藏已达上限（${prefs.getTodayActionCount()}），自动结束散步模式"
+                    "散步模式",
+                    "今日点赞/收藏已达上限（${prefs.getTodayActionCount()}），自动结束散步模式"
                 )
             )
             notifyUser("今日点赞/收藏已达上限（${prefs.getTodayActionCount()}），已自动停止散步模式")
@@ -770,9 +919,13 @@ class DouyinAccessibilityService : AccessibilityService() {
                         if (keepAliveStarted) stopKeepAlive()
                         val now = System.currentTimeMillis()
                         if (now - lastCaptureMissingLog > 10_000) {
+                            val msg = "录屏未授权，无法分析（请先在「模型」页开启录屏）"
+
+                            notifyUser(msg)
+//                            Toast.makeText(applicationContext, "$msg", Toast.LENGTH_LONG).show()
                             addLog(
                                 OperationLog.statusLog(
-                                    "散步模式", "录屏未授权，无法分析（请先在「模型」页开启录屏）"
+                                    "散步模式", msg
                                 )
                             )
                             lastCaptureMissingLog = now
@@ -801,7 +954,10 @@ class DouyinAccessibilityService : AccessibilityService() {
                                 // 随机间隔抖动：模拟真人看完视频后的自然停顿，打破规律节奏，降低风控命中
                                 val jMin = prefs.jitterMinMsFlow.first()
                                 val jMax = prefs.jitterMaxMsFlow.first()
-                                val jitter = if (jMax > jMin) Random.nextLong(jMin.toLong(), jMax.toLong()) else jMin.toLong()
+                                val jitter = if (jMax > jMin) Random.nextLong(
+                                    jMin.toLong(),
+                                    jMax.toLong()
+                                ) else jMin.toLong()
                                 delay(2600 + jitter)
                             } else {
                                 // 仍是同一个视频：若切换失败则定时重试，否则稍后再看
