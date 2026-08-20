@@ -1,5 +1,8 @@
 package com.douyin.auto.ui
 
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,48 +14,42 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.douyin.auto.model.OperationLog
+import com.douyin.auto.data.LogRepository
+import com.douyin.auto.data.OperationLogEntity
 import com.douyin.auto.model.OperationType
 import com.douyin.auto.ui.theme.*
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
 /**
  * 操作日志界面
  *
- * 显示所有操作日志，支持按类型筛选和清除
+ * 数据源：Room [LogRepository]（持久化，跨服务重启保留）。
+ * 视频级日志（分析/点赞/收藏）若带分享链接，点击可跳转到抖音该视频。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LogScreen(
     onNavigateBack: () -> Unit = {}
 ) {
-    // 日志列表
-    val logs = remember { mutableStateListOf<OperationLog>() }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val repository = remember { LogRepository.get(context) }
+
+    // 从 Room 订阅全部日志（倒序）
+    val allLogs by repository.allFlow().collectAsState(initial = emptyList())
     var filterType by remember { mutableStateOf<OperationType?>(null) }
     val listState = rememberLazyListState()
 
-    // 监听日志
-    LaunchedEffect(Unit) {
-        // 先预加载服务内缓冲的历史日志（按时间顺序，最新的排在前面）
-        com.douyin.auto.DouyinAccessibilityService.instance
-            ?.getLogHistory()
-            ?.let { logs.addAll(it.asReversed()) }
-        com.douyin.auto.DouyinAccessibilityService.logListener = { log ->
-            logs.add(0, log) // 最新的在前
-            if (logs.size > 500) {
-                logs.removeRange(400, logs.size)
-            }
-        }
-    }
-
-    // 过滤后的日志
-    val filteredLogs = remember(logs.toList(), filterType) {
-        if (filterType == null) logs.toList()
-        else logs.filter { it.action == filterType }
+    // 本地筛选
+    val filteredLogs = remember(allLogs, filterType) {
+        if (filterType == null) allLogs
+        else allLogs.filter { it.toOperationType() == filterType }
     }
 
     Scaffold(
@@ -65,8 +62,10 @@ fun LogScreen(
                     }
                 },
                 actions = {
-                    if (logs.isNotEmpty()) {
-                        IconButton(onClick = { logs.clear() }) {
+                    if (allLogs.isNotEmpty()) {
+                        IconButton(onClick = {
+                            scope.launch { repository.clear() }
+                        }) {
                             Icon(
                                 Icons.Default.DeleteSweep,
                                 contentDescription = "清除日志",
@@ -92,13 +91,12 @@ fun LogScreen(
             FilterBar(
                 currentFilter = filterType,
                 onFilterChange = { filterType = it },
-                totalCount = logs.size,
+                totalCount = allLogs.size,
                 filteredCount = filteredLogs.size
             )
 
             // ---- 日志列表 ----
             if (filteredLogs.isEmpty()) {
-                // 空状态
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -136,12 +134,26 @@ fun LogScreen(
                         items = filteredLogs,
                         key = { it.id }
                     ) { log ->
-                        LogItem(log = log)
+                        LogItem(log = log, onOpenVideo = { openVideo(context, log) })
                     }
                 }
             }
         }
     }
+}
+
+/**
+ * 跳转到抖音打开指定视频。
+ * 优先用 aweme_id 走 deeplink（snssdk1128），其次用分享短链。
+ */
+private fun openVideo(context: android.content.Context, log: OperationLogEntity) {
+    val uri = when {
+        log.awemeId != null -> Uri.parse("snssdk1128://aweme/detail/${log.awemeId}")
+        !log.videoUrl.isNullOrBlank() -> Uri.parse(log.videoUrl)
+        else -> return
+    }
+    val intent = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
 }
 
 /**
@@ -235,10 +247,13 @@ private fun FilterBar(
 
 /**
  * 单条日志项
+ *
+ * 视频级日志（分析/点赞/收藏）若带链接，整张卡片可点击跳转到该视频，右侧显示跳转箭头。
  */
 @Composable
-private fun LogItem(log: OperationLog) {
-    val (icon, color) = when (log.action) {
+private fun LogItem(log: OperationLogEntity, onOpenVideo: () -> Unit) {
+    val action = log.toOperationType()
+    val (icon, color) = when (action) {
         OperationType.SCAN -> Icons.Default.Search to NormalBlue
         OperationType.CLASSIFY -> Icons.Default.Category to IntentOrange
         OperationType.FOLLOW -> Icons.Default.PersonAdd to StatusGreen
@@ -251,7 +266,13 @@ private fun LogItem(log: OperationLog) {
 
     val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
+    // 可跳转：视频级操作且带链接
+    val canJump = action in VIDEO_ACTIONS && (log.awemeId != null || !log.videoUrl.isNullOrBlank())
+
     Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (canJump) Modifier.clickable { onOpenVideo() } else Modifier),
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
@@ -271,7 +292,7 @@ private fun LogItem(log: OperationLog) {
             ) {
                 Icon(
                     imageVector = icon,
-                    contentDescription = log.action.name,
+                    contentDescription = action.name,
                     tint = color,
                     modifier = Modifier.size(20.dp)
                 )
@@ -287,7 +308,7 @@ private fun LogItem(log: OperationLog) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "${actionLabel(log.action)} · ${log.target}",
+                        text = "${actionLabel(action)} · ${log.target}",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
@@ -314,9 +335,25 @@ private fun LogItem(log: OperationLog) {
                     )
                 }
             }
+
+            // 可跳转日志显示箭头，提示可点击
+            if (canJump) {
+                Spacer(modifier = Modifier.width(4.dp))
+                Icon(
+                    Icons.Default.ChevronRight,
+                    contentDescription = "跳转到视频",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
         }
     }
 }
+
+/** 可跳转到视频的操作类型 */
+private val VIDEO_ACTIONS = setOf(
+    OperationType.ANALYZE, OperationType.LIKE, OperationType.COLLECT
+)
 
 /**
  * 结果标签

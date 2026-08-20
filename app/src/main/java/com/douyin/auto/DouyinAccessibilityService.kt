@@ -2,6 +2,9 @@ package com.douyin.auto
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
@@ -11,11 +14,14 @@ import java.util.ArrayDeque
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import com.douyin.auto.config.AppPreferences
+import com.douyin.auto.data.LogRepository
+import com.douyin.auto.data.parseAwemeId
 import com.douyin.auto.media.ScreenCaptureService
 import com.douyin.auto.model.CommentCategory
 import com.douyin.auto.model.CommentInfo
 import com.douyin.auto.model.IntentKeywords
 import com.douyin.auto.model.OperationLog
+import com.douyin.auto.model.OperationType
 import com.douyin.auto.service.AutoFollowEngine
 import com.douyin.auto.service.CommentClassifier
 import com.douyin.auto.service.CommentScanner
@@ -78,9 +84,6 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         /** 统计更新监听器 */
         var statsListener: ((Stats) -> Unit)? = null
-
-        /** 日志监听器 */
-        var logListener: ((OperationLog) -> Unit)? = null
 
         // ---- 双击点赞相关常量 ----
         /** 双击选点时禁区外扩边距（dp），降低擦边误触可点击元素的概率 */
@@ -186,8 +189,16 @@ class DouyinAccessibilityService : AccessibilityService() {
     /** 已记录评论去重集合（会话内同一评论只记录一次，避免滚动回看时重复） */
     private val seenCommentKeys = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
-    /** 历史日志缓冲（跨页面/跨时间保留，供日志页读取，避免只在打开页面时记录） */
-    private val logHistory = Collections.synchronizedList(mutableListOf<OperationLog>())
+    /** 操作日志仓库（Room 持久化），在 onServiceConnected 初始化 */
+    private lateinit var logRepository: LogRepository
+
+    /**
+     * 当前正在处理的视频的分享链接 (url, awemeId)。
+     * 由 [analyzeAndAct] 在分析前取链写入，供视频级日志（分析/点赞/收藏）附链落盘；
+     * 视频处理结束后置空。非视频级日志忽略此字段。
+     */
+    @Volatile
+    private var currentVideoLink: Pair<String, String?>? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -201,6 +212,7 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         // 初始化组件
         prefs = AppPreferences(this)
+        logRepository = LogRepository.get(this)
         followEngine = AutoFollowEngine(prefs, serviceScope)
         videoAnalyzer = VideoContentAnalyzer(prefs)
 
@@ -417,18 +429,20 @@ class DouyinAccessibilityService : AccessibilityService() {
     // ---- 日志和统计 ----
 
     private fun addLog(log: OperationLog) {
-        logHistory.add(log)
-        if (logHistory.size > 2000) logHistory.removeAt(0)
-        logListener?.invoke(log)
         Log.d(TAG, "[${log.action}] ${log.target}: ${log.result} - ${log.detail}")
+
+        // 落盘到 Room。视频级操作（分析/点赞/收藏）附带当前视频链接，供点击跳转。
+        val isVideoAction = log.action in VIDEO_ACTIONS_WITH_LINK
+        val link = if (isVideoAction) currentVideoLink else null
+        serviceScope.launch {
+            logRepository.insert(log, videoUrl = link?.first, awemeId = link?.second)
+        }
     }
 
-    /**
-     * 获取历史日志快照（供 UI 读取，弥补实时监听在页面未打开时遗漏的问题）
-     */
-    fun getLogHistory(): List<OperationLog> = synchronized(logHistory) {
-        ArrayList(logHistory)
-    }
+    /** 可附带视频链接的操作类型（点击日志可跳转到该视频） */
+    private val VIDEO_ACTIONS_WITH_LINK = setOf(
+        OperationType.ANALYZE, OperationType.LIKE, OperationType.COLLECT
+    )
 
     private fun notifyStats() {
         statsListener?.invoke(
@@ -899,6 +913,112 @@ class DouyinAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 通过「分享 → 复制链接」获取当前视频的分享链接，并解析 aweme_id。
+     *
+     * 流程：点分享按钮 → 轮询等待分享面板出现 → 点「复制链接」→ 读剪贴板 → 按返回键关闭面板。
+     * 全程带超时与兜底，任何环节失败均返回 null，不抛异常、不阻塞主流程。
+     *
+     * 注意：会弹出分享面板约 1~2 秒，并消耗一次剪贴板内容。仅在散步模式下、
+     * 对需要落盘的视频级操作调用。
+     *
+     * @return (分享链接, awemeId) 二元组；awemeId 可能为 null（短链无法本地解析）
+     */
+    private suspend fun captureCurrentVideoShareLink(): Pair<String, String?>? {
+        // 清空剪贴板，便于后续判断「复制链接」是否成功写入了新内容
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        runCatching { clipboard.setPrimaryClip(ClipData.newPlainText("", "")) }
+
+        // 1) 找并点击「分享/转发」按钮
+        val root1 = rootInActiveWindow ?: return null
+        try {
+            val shareNode = findVideoActionNode(
+                root1,
+                labels = listOf("分享", "转发"),
+                exclude = listOf("分享给朋友", "分享到")
+            )
+            if (shareNode == null) {
+                Log.w(TAG, "取链失败：未找到分享按钮")
+                return null
+            }
+            val clicked = shareNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            shareNode.recycle()
+            if (!clicked) {
+                Log.w(TAG, "取链失败：分享按钮点击无响应")
+                return null
+            }
+        } finally {
+            root1.recycle()
+        }
+
+        // 2) 轮询等待分享面板出现，找到「复制链接」按钮（最多等 3s）
+        val copyLabels = listOf("复制链接", "复制", "copy link", "复制分享链接")
+        val copyNode = waitForNode(copyLabels, timeoutMs = 3000)
+            ?: run {
+                Log.w(TAG, "取链失败：分享面板未出现「复制链接」")
+                // 兜底按返回关闭可能弹出的面板
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                return null
+            }
+
+        // 3) 点击「复制链接」
+        val copyClicked = copyNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        copyNode.recycle()
+        if (!copyClicked) {
+            Log.w(TAG, "取链失败：「复制链接」点击无响应")
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            return null
+        }
+
+        // 4) 等待剪贴板写入（最多 1.5s），读取链接
+        var link: String? = null
+        val deadline = System.currentTimeMillis() + 1500
+        while (System.currentTimeMillis() < deadline) {
+            delay(150)
+            val text = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+            if (!text.isNullOrBlank() && (text.contains("http") || text.contains("douyin"))) {
+                link = text.trim()
+                break
+            }
+        }
+
+        // 5) 关闭分享面板
+        performGlobalAction(GLOBAL_ACTION_BACK)
+
+        if (link == null) {
+            Log.w(TAG, "取链失败：剪贴板未捕获到链接")
+            return null
+        }
+        // 从文案里提取 URL（抖音复制链接格式通常为「X.XXXX 抖音文案 https://v.douyin.com/xxx/」）
+        val url = Regex("""https?://[^\s，,。]+""").find(link)?.value ?: link
+        val awemeId = parseAwemeId(url)
+        Log.d(TAG, "取链成功：url=$url, awemeId=$awemeId")
+        return url to awemeId
+    }
+
+    /**
+     * 轮询当前节点树，等待出现文本命中 [labels] 任一的可点击节点。
+     * @return 命中节点（已从可点击祖先回溯，调用方负责 recycle）；超时返回 null
+     */
+    private suspend fun waitForNode(
+        labels: List<String>, timeoutMs: Long
+    ): AccessibilityNodeInfo? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val root = rootInActiveWindow
+            if (root != null) {
+                try {
+                    val node = findVideoActionNode(root, labels, exclude = emptyList())
+                    if (node != null) return node
+                } finally {
+                    root.recycle()
+                }
+            }
+            delay(200)
+        }
+        return null
+    }
+
+    /**
      * 识别「当前正在播放的是哪一个视频」：拼接作者名与文案作为身份标识。
      * 身份变化即代表刷到了新视频，触发一次分析。
      */
@@ -1033,6 +1153,8 @@ class DouyinAccessibilityService : AccessibilityService() {
      * 分析当前视频并按配置决定是否点赞/收藏，最后提示用户决策结果。
      */
     private suspend fun analyzeAndAct(identity: String) {
+        // 每条视频开始：重置链接，避免残留上一条视频的分享链接
+        currentVideoLink = null
         // 直播场景：直接跳过，不调用大模型、不点赞/收藏
         rootInActiveWindow?.let { root ->
             try {
@@ -1051,6 +1173,12 @@ class DouyinAccessibilityService : AccessibilityService() {
             }
         }
         addLog(OperationLog.statusLog("散步模式", "正在分析视频：$identity"))
+        // 取当前视频分享链接（弹分享面板→复制链接→读剪贴板→关闭面板），供视频级日志点击跳转。
+        // 失败不阻塞主流程，视频级日志将无链落盘（仍可查看，只是不可跳转）。
+        currentVideoLink = runCatching { captureCurrentVideoShareLink() }.getOrNull()
+        if (currentVideoLink == null) {
+            addLog(OperationLog.statusLog("取链", "未能获取本视频分享链接，日志将无法跳转"))
+        }
         val result = try {
             videoAnalyzer.analyze()
         } catch (e: Exception) {

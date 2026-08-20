@@ -137,6 +137,50 @@ fun CopyrightScreen(
                 }
             }
 
+            // ---- 免责声明（红色警告）----
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = StatusRed.copy(alpha = 0.1f))
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Gavel,
+                            contentDescription = null,
+                            tint = StatusRed,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "⚠️ 免责声明",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = StatusRed
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "本工具仅用于辅助用户在抖音平台进行评论内容分析和意向客户识别。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        lineHeight = 22.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "1. 请遵守抖音平台用户协议和相关法律法规。\n" +
+                                "2. 本工具不会自动点赞、自动评论或进行任何违规操作。\n" +
+                                "3. 使用本工具产生的任何后果由用户自行承担。\n" +
+                                "4. 请合理使用，避免频繁操作影响账号安全。\n" +
+                                "5. 本程序仅供学习交流、测试研究使用，严禁商用。\n" +
+                                "6. 使用本程序导致封号等一切问题，与开发者无关。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        lineHeight = 24.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+
             // ---- 唯一官方联系方式 ----
             CopyrightSection(
                 icon = Icons.Default.ContactMail,

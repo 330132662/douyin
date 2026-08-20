@@ -492,7 +492,7 @@ private fun UsageTipsCard() {
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "⚠️ 免责声明：本工具仅供辅助使用，请遵守抖音平台规则和相关法律法规。视频点赞/收藏仅在「模型」页开启「自动点赞/收藏」后才会执行，请合理使用避免影响账号安全。",
+                text = "⚠️ 免责声明：本工具仅供辅助使用，请遵守抖音平台规则和相关法律法规。视频点赞/收藏仅在「模型」页开启「自动点赞/收藏」后才会执行，请合理使用避免影响账号安全。本程序仅供学习交流、测试研究，严禁商用；使用本程序导致封号等一切问题，与开发者无关。",
                 style = MaterialTheme.typography.bodySmall,
                 color = StatusRed.copy(alpha = 0.8f),
                 lineHeight = 18.sp,
