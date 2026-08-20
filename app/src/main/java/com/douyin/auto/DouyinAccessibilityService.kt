@@ -965,6 +965,50 @@ class DouyinAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 检测是否已「**进入直播间**」（区别于直播预览卡片，见 [detectLiveStream]）。
+     *
+     * 判别逻辑：
+     * - 直播预览卡片带有「点击进入直播间」按钮（CTA），而真正进入直播间后该 CTA 消失；
+     * - 真正进入直播间后，界面上会出现**公屏聊天输入框**（EditText，hint 含 主播/公屏/弹幕/聊 等），
+     *   推荐流主播放页不存在这种输入框，命中即判定为「确实进了直播间」。
+     *
+     * @return true 表示当前已在直播间内部（非预览），应执行「按返回键回到推荐列表」逻辑。
+     */
+    private fun detectEnteredLiveRoom(root: AccessibilityNodeInfo): Boolean {
+        var hasLiveChat = false
+        var hasPreviewCta = false
+        val chatHints = listOf("主播", "公屏", "弹幕", "聊")
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val isRoot = node == root
+            val text = node.text?.toString() ?: ""
+            val desc = node.contentDescription?.toString() ?: ""
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                node.hintText?.toString() ?: ""
+            } else ""
+            val id = node.viewIdResourceName ?: ""
+            val label = (text + " " + desc + " " + hint + " " + id).lowercase()
+            if (!hasPreviewCta &&
+                listOf("点击进入直播间", "进入直播间").any { it in label }
+            ) {
+                hasPreviewCta = true
+            }
+            if (!hasLiveChat && (node.isEditable ||
+                    node.className?.toString()?.contains("EditText") == true)
+            ) {
+                if (chatHints.any { it in (hint + " " + text) }) {
+                    hasLiveChat = true
+                }
+            }
+            repeat(node.childCount) { i -> node.getChild(i)?.let { queue.add(it) } }
+            if (!isRoot) node.recycle()
+        }
+        // 进了直播间：存在公屏聊天框，且已没有预览 CTA
+        return hasLiveChat && !hasPreviewCta
+    }
+
+    /**
      * 分析当前视频并按配置决定是否点赞/收藏，最后提示用户决策结果。
      */
     private suspend fun analyzeAndAct(identity: String) {
@@ -1131,18 +1175,32 @@ class DouyinAccessibilityService : AccessibilityService() {
                     val root = rootInActiveWindow
                     if (root != null) {
                         try {
-                            // 直播前置检测（独立快照）：命中「点击进入直播间」等信号立即跳过，绝不调用大模型
+                            // 直播前置检测（独立快照）
                             val liveRoot = rootInActiveWindow
                             if (liveRoot != null) {
+                                // 1) 已进入直播间（非预览卡片）：按一下返回键，回到推荐列表界面
+                                if (detectEnteredLiveRoom(liveRoot)) {
+                                    addLog(
+                                        OperationLog.statusLog(
+                                            "散步模式", "检测到已进入直播间，按返回键回到推荐列表"
+                                        )
+                                    )
+                                    notifyUser("已进入直播间，按返回键中…")
+                                    performGlobalAction(GLOBAL_ACTION_BACK)
+                                    liveRoot.recycle()
+                                    delay(1500)
+                                    continue
+                                }
+                                // 2) 直播预览卡片（如「点击进入直播间」）：跳过并切下一个视频，绝不调用大模型
                                 val live = detectLiveStream(liveRoot)
                                 liveRoot.recycle()
                                 if (live.isLive) {
                                     addLog(
                                         OperationLog.statusLog(
-                                            "散步模式", "检测到直播间（${live.reason}），跳过"
+                                            "散步模式", "检测到直播预览（${live.reason}），跳过"
                                         )
                                     )
-                                    notifyUser("检测到直播间，已跳过")
+                                    notifyUser("检测到直播，已跳过")
                                     lastVideoIdentity = LIVE_SKIP_MARKER
                                     advanceToNextVideo()
                                     lastAdvanceTime = System.currentTimeMillis()

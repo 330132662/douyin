@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import com.douyin.auto.ui.CopyrightScreen
 import com.douyin.auto.ui.KeywordSettingsScreen
 import com.douyin.auto.ui.LogScreen
 import com.douyin.auto.ui.MainScreen
@@ -59,7 +60,8 @@ private fun MainApp() {
                 onNavigateToHome = { currentPage = Page.HOME },
                 onNavigateToKeywords = { currentPage = Page.KEYWORDS },
                 onNavigateToLogs = { currentPage = Page.LOGS },
-                onNavigateToModel = { currentPage = Page.MODEL }
+                onNavigateToModel = { currentPage = Page.MODEL },
+                onNavigateToCopyright = { currentPage = Page.COPYRIGHT }
             )
         }
         Page.KEYWORDS -> {
@@ -77,6 +79,11 @@ private fun MainApp() {
                 onNavigateBack = { currentPage = Page.HOME }
             )
         }
+        Page.COPYRIGHT -> {
+            CopyrightScreen(
+                onNavigateBack = { currentPage = Page.HOME }
+            )
+        }
     }
 }
 
@@ -84,5 +91,5 @@ private fun MainApp() {
  * 页面枚举
  */
 enum class Page {
-    HOME, KEYWORDS, LOGS, MODEL
+    HOME, KEYWORDS, LOGS, MODEL, COPYRIGHT
 }

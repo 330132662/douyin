@@ -4,6 +4,7 @@ import android.content.Intent
 import android.provider.Settings
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -38,7 +39,8 @@ fun MainScreen(
     onNavigateToHome: () -> Unit = {},
     onNavigateToKeywords: () -> Unit = {},
     onNavigateToLogs: () -> Unit = {},
-    onNavigateToModel: () -> Unit = {}
+    onNavigateToModel: () -> Unit = {},
+    onNavigateToCopyright: () -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -133,6 +135,11 @@ fun MainScreen(
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // ---- 版权声明入口（首页显眼处）----
+            CopyrightNoticeBanner(onClick = onNavigateToCopyright)
+
+            Spacer(modifier = Modifier.height(16.dp))
+
             // ---- 服务状态卡片 ----
             ServiceStatusCard(
                 isRunning = isServiceRunning,
@@ -479,6 +486,55 @@ private fun UsageTipsCard() {
                 color = StatusRed.copy(alpha = 0.8f),
                 lineHeight = 18.sp,
                 fontSize = 11.sp
+            )
+        }
+    }
+}
+
+/**
+ * 首页顶部版权声明入口（醒目横幅）
+ */
+@Composable
+private fun CopyrightNoticeBanner(onClick: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() },
+        shape = RoundedCornerShape(14.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.Copyright,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.size(28.dp)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "版权声明 · 免费说明",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimary
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "本应用当前完全免费，遇收费即骗子",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.9f)
+                )
+            }
+            Icon(
+                Icons.Default.ChevronRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onPrimary
             )
         }
     }
