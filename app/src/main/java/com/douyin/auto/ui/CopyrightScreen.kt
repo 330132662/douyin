@@ -65,7 +65,7 @@ fun CopyrightScreen(
                 icon = Icons.Default.Copyright,
                 iconColor = Primary,
                 title = "版权归属",
-                body = "本应用《抖音获客助手》（又名"斗篷助手"）的全部源代码、界面设计、文档及" +
+                body = "本应用《抖音获客助手》（又名'斗篷助手'）的全部源代码、界面设计、文档及" +
                         "相关素材，版权均归作者本人所有。未经作者书面授权，任何人不得用于商业" +
                         "售卖、二次分发或声称其为自有作品。"
             )
@@ -128,7 +128,7 @@ fun CopyrightScreen(
                     Spacer(Modifier.height(10.dp))
                     Text(
                         text = "如您遇到任何人以本应用名义向您收费、售卖激活码、索要" +
-                                ""授权费 / 会员费"，或要求转账，均为骗子冒充，与作者无关。\n\n" +
+                                "'授权费 / 会员费'，或要求转账，均为骗子冒充，与作者无关。\n\n" +
                                 "请牢记：真正的作者永远不会向您收费。遇到收费，就是遇到了骗子。",
                         style = MaterialTheme.typography.bodyMedium,
                         lineHeight = 22.sp,
