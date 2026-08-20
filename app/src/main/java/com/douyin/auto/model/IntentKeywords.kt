@@ -119,6 +119,13 @@ object IntentKeywords {
     /** 已收藏状态文本（用于跳过，避免重复收藏） */
     val COLLECTED_TEXTS: List<String> = listOf("已收藏", "取消收藏")
 
+    /** 直播间特征文本（命中即判定为直播，跳过视频分析以免误触）。
+     *  以「点击进入直播间」预览卡片信号为主，兼顾已在直播间内的「直播中/正在直播」等。 */
+    val LIVE_TEXTS: List<String> = listOf(
+        "点击进入直播间", "进入直播间", "直播间",
+        "直播中", "正在直播", "直播", "live"
+    )
+
     /** 评论页面特征文本（用于判断当前是否在评论区） */
     val COMMENT_PAGE_TEXTS: List<String> = listOf(
         "评论", "共", "条评论", "回复"

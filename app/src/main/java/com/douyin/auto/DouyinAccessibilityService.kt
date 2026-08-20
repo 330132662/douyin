@@ -550,40 +550,133 @@ class DouyinAccessibilityService : AccessibilityService() {
     // ---- 视频内容分析：点赞 / 收藏 / 自动刷视频 ----
 
     /**
-     * 在根节点中查找匹配 [labels] 且未命中 [exclude] 的可点击节点
+     * 在根节点中查找匹配 [labels] 且未命中 [exclude] 的「可点击」节点
      * （兼容 text 与 contentDescription，用于定位点赞/收藏按钮）。
+     *
+     * 关键点：抖音的右侧操作按钮通常是「可点击容器 + 内部文字/图标子节点」结构，
+     * 文字（如「收藏」）往往不在可点击节点自身，而在其子 TextView 上。
+     * 因此这里先找到命中关键词的节点，再向上回溯到最近的可点击祖先来点击，
+     * 避免「按钮文字落在非可点击子节点上」导致一直找不到按钮（表现为「一直收藏失败」）。
      */
     private fun findVideoActionNode(
         root: AccessibilityNodeInfo, labels: List<String>, exclude: List<String>
     ): AccessibilityNodeInfo? {
+        // 收集整棵树节点引用并记录父子关系（本次搜索不回收，便于向上回溯祖先）
+        val all = ArrayList<AccessibilityNodeInfo>()
+        val parentOf = HashMap<AccessibilityNodeInfo, AccessibilityNodeInfo?>()
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        var found: AccessibilityNodeInfo? = null
+        all.add(root)
+        parentOf[root] = null
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
-            val isRoot = node == root
+            repeat(node.childCount) { i ->
+                node.getChild(i)?.let { child ->
+                    all.add(child)
+                    parentOf[child] = node
+                    queue.add(child)
+                }
+            }
+        }
+
+        // 1) 找到自身命中 label 且未命中 exclude 的节点
+        var textNode: AccessibilityNodeInfo? = null
+        for (n in all) {
             val label = buildString {
-                append(node.text?.toString() ?: "")
+                append(n.text?.toString() ?: "")
                 append(" ")
-                append(node.contentDescription?.toString() ?: "")
+                append(n.contentDescription?.toString() ?: "")
                 append(" ")
-                append(node.viewIdResourceName ?: "")
+                append(n.viewIdResourceName ?: "")
             }.lowercase()
             val hit = labels.any { it.lowercase() in label }
             val excl = exclude.any { it.lowercase() in label }
-            if (hit && !excl && node.isClickable) {
-                found = node
+            if (hit && !excl) {
+                textNode = n
                 break
             }
-            repeat(node.childCount) { i ->
-                node.getChild(i)?.let { queue.add(it) }
-            }
-            // 仅回收非根节点，根节点由调用方在 finally 中回收
-            if (!isRoot) node.recycle()
         }
-        // 回收队列中剩余节点（found 已移出队列，由调用方回收）
-        while (queue.isNotEmpty()) queue.removeFirst().recycle()
-        return found
+
+        // 2) 从命中节点向上找最近的可点击祖先（含自身）
+        var clickable: AccessibilityNodeInfo? = null
+        var cur = textNode
+        while (cur != null) {
+            if (cur.isClickable) {
+                clickable = cur
+                break
+            }
+            cur = parentOf[cur]
+        }
+
+        // 3) 回收除 root 与返回节点外的所有节点（root 由调用方在 finally 中回收）
+        for (n in all) {
+            if (n != root && n != clickable) n.recycle()
+        }
+        return clickable
+    }
+
+    /**
+     * 按「右栏位置」定位收藏（白色五角星）按钮。
+     *
+     * 抖音的收藏按钮是五角星图标，很多版本没有「收藏」文字/描述，纯文本搜索找不到。
+     * 这里以右栏的「评论」与「分享」按钮为上下锚点，取二者之间、且非其它已知按钮
+     * （赞/头像/音乐等）的可点击图标按钮，即判定为收藏按钮。
+     * 整树收集后统一回收（root 与返回节点除外），避免重复回收或内存泄漏。
+     */
+    private fun findCollectButtonByPosition(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels
+        val h = dm.heightPixels
+        val railLeft = (w * 0.70f).toInt()   // 右栏起点（留余量防误判）
+        val top = (h * 0.25f).toInt()
+        val bottom = (h * 0.95f).toInt()
+
+        // 收集整棵树节点引用（本次搜索不回收，便于计算与统一回收）
+        val all = ArrayList<AccessibilityNodeInfo>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        all.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            repeat(node.childCount) { i ->
+                node.getChild(i)?.let { child ->
+                    all.add(child)
+                    queue.add(child)
+                }
+            }
+        }
+
+        data class Hit(val node: AccessibilityNodeInfo, val cx: Int, val cy: Int, val label: String)
+        val hits = ArrayList<Hit>()
+        for (n in all) {
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            val cx = r.centerX()
+            val cy = r.centerY()
+            if (n.isClickable && cx in railLeft until w && cy in top until bottom) {
+                val label = buildString {
+                    append(n.text?.toString() ?: "")
+                    append(" ")
+                    append(n.contentDescription?.toString() ?: "")
+                }.lowercase()
+                hits.add(Hit(n, cx, cy, label))
+            }
+        }
+
+        val commentY = hits.firstOrNull { "评论" in it.label }?.cy ?: -1
+        val shareY = hits.firstOrNull { "分享" in it.label || "转发" in it.label }?.cy ?: -1
+        val star = if (commentY >= 0 && shareY >= 0) {
+            hits.filter {
+                it.cy > commentY && it.cy < shareY &&
+                        !listOf("评论", "分享", "转发", "赞", "头像", "音乐", "原声")
+                            .any { k -> k in it.label }
+            }.minByOrNull { Math.abs(it.cy - (commentY + shareY) / 2) }?.node
+        } else {
+            null
+        }
+
+        for (n in all) if (n != root && n != star) n.recycle()
+        return star
     }
 
     /**
@@ -742,29 +835,66 @@ class DouyinAccessibilityService : AccessibilityService() {
 
     /**
      * 对当前视频执行收藏（若已收藏则跳过）。
+     * 先尝试无障碍 ACTION_CLICK；若返回 false（部分自定义 View 不响应无障碍点击），
+     * 回退为在该按钮中心下发「单击」手势，提高成功率。
      */
     private suspend fun performCollect(): Boolean {
         val root = rootInActiveWindow ?: return false
         try {
-            val node = findVideoActionNode(
+            // 1) 优先按文本/描述/资源id 找收藏按钮
+            var node = findVideoActionNode(
                 root, IntentKeywords.COLLECT_TEXTS, IntentKeywords.COLLECTED_TEXTS
             )
+            // 2) 回退：纯图标五角星按钮无「收藏」文字，按右栏位置定位（需重新取快照，
+            //    上一次遍历已回收子树，root 子树已失效）
             if (node == null) {
-                addLog(OperationLog.collectLog(false, "未找到收藏按钮"))
+                node = rootInActiveWindow?.let { r2 ->
+                    val found = findCollectButtonByPosition(r2)
+                    r2.recycle()
+                    found
+                }
+            }
+            if (node == null) {
+                addLog(OperationLog.collectLog(false, "未找到收藏按钮（含五角星位置定位）"))
                 return false
             }
-            val ok = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            node.recycle()
-            if (ok) {
+            // 先取按钮中心坐标（回退手势用），再据此释放节点
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            val cx = r.centerX()
+            val cy = r.centerY()
+
+            val okClick = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            if (okClick) {
                 collectedCount++
                 addLog(OperationLog.collectLog(true))
-            } else {
-                addLog(OperationLog.collectLog(false, "点击失败"))
+                node.recycle()
+                return true
             }
-            return ok
+            // ACTION_CLICK 无效 → 改用手势单击按钮中心
+            node.recycle()
+            val okGesture = dispatchTap(cx, cy)
+            if (okGesture) {
+                collectedCount++
+                addLog(OperationLog.collectLog(true, "无障碍点击无效，改用单击手势"))
+            } else {
+                addLog(OperationLog.collectLog(false, "点击失败（请检查无障碍「执行手势」权限）"))
+            }
+            return okGesture
         } finally {
             root.recycle()
         }
+    }
+
+    /**
+     * 在指定屏幕坐标下发一次「单击」手势（按下后极短释放），
+     * 用于无障碍 ACTION_CLICK 不生效时兜底触发按钮。
+     */
+    private fun dispatchTap(x: Int, y: Int): Boolean {
+        val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 60)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        return runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
     }
 
     /**
@@ -792,10 +922,69 @@ class DouyinAccessibilityService : AccessibilityService() {
         return if (parts.isEmpty()) null else parts.joinToString("|")
     }
 
+    /** 直播间检测（预览卡片或已进入直播间均适用），不依赖大模型。 */
+    private data class LiveDetectResult(val isLive: Boolean, val reason: String)
+
+    /** 直播跳过标记：避免同一张直播预览卡片在循环里被反复判定为“新视频”。 */
+    private val LIVE_SKIP_MARKER = "__live_room_skipped__"
+
+    /**
+     * 检测当前屏幕是否为直播间/直播预览。纯无障碍节点文本扫描，**不调用大模型**。
+     * 命中 [IntentKeywords.LIVE_TEXTS] 任一特征文本（含 EditText 的 hintText）即判定为直播。
+     */
+    private fun detectLiveStream(root: AccessibilityNodeInfo): LiveDetectResult {
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        var hitText: String? = null
+        var weak = false
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val isRoot = node == root
+            val text = node.text?.toString() ?: ""
+            val desc = node.contentDescription?.toString() ?: ""
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                node.hintText?.toString() ?: ""
+            } else ""
+            val id = node.viewIdResourceName ?: ""
+            val label = (text + " " + desc + " " + hint + " " + id).lowercase()
+            if (hitText == null && IntentKeywords.LIVE_TEXTS.any { it.lowercase() in label }) {
+                hitText = text.ifBlank { desc.ifBlank { hint.ifBlank { id } } }
+            }
+            if (!weak && listOf("直播", "live", "进入直播间", "说点", "礼物", "粉丝")
+                    .any { it in label }
+            ) {
+                weak = true
+            }
+            repeat(node.childCount) { i -> node.getChild(i)?.let { queue.add(it) } }
+            if (!isRoot) node.recycle()
+        }
+        return if (hitText != null) {
+            LiveDetectResult(true, "命中直播文本：$hitText")
+        } else {
+            LiveDetectResult(false, "未命中直播特征（弱信号=$weak）")
+        }
+    }
+
     /**
      * 分析当前视频并按配置决定是否点赞/收藏，最后提示用户决策结果。
      */
     private suspend fun analyzeAndAct(identity: String) {
+        // 直播场景：直接跳过，不调用大模型、不点赞/收藏
+        rootInActiveWindow?.let { root ->
+            try {
+                val live = detectLiveStream(root)
+                if (live.isLive) {
+                    addLog(
+                        OperationLog.statusLog(
+                            "散步模式", "检测到直播（${live.reason}），跳过分析（不调用大模型）"
+                        )
+                    )
+                    notifyUser("检测到直播，已跳过")
+                    return
+                }
+            } finally {
+                root.recycle()
+            }
+        }
         addLog(OperationLog.statusLog("散步模式", "正在分析视频：$identity"))
         val result = try {
             videoAnalyzer.analyze()
@@ -942,6 +1131,25 @@ class DouyinAccessibilityService : AccessibilityService() {
                     val root = rootInActiveWindow
                     if (root != null) {
                         try {
+                            // 直播前置检测（独立快照）：命中「点击进入直播间」等信号立即跳过，绝不调用大模型
+                            val liveRoot = rootInActiveWindow
+                            if (liveRoot != null) {
+                                val live = detectLiveStream(liveRoot)
+                                liveRoot.recycle()
+                                if (live.isLive) {
+                                    addLog(
+                                        OperationLog.statusLog(
+                                            "散步模式", "检测到直播间（${live.reason}），跳过"
+                                        )
+                                    )
+                                    notifyUser("检测到直播间，已跳过")
+                                    lastVideoIdentity = LIVE_SKIP_MARKER
+                                    advanceToNextVideo()
+                                    lastAdvanceTime = System.currentTimeMillis()
+                                    delay(1200)
+                                    continue
+                                }
+                            }
                             val identity = detectVideoIdentity(root)
                             if (identity != null && identity != lastVideoIdentity) {
                                 // 刷到新视频：抓取前 10 秒随机几帧 → 分析 → 自动点赞/收藏 → 提示 → 切下一个
