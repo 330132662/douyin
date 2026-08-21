@@ -134,4 +134,33 @@ object IntentKeywords {
     val COMMENT_PAGE_TEXTS: List<String> = listOf(
         "评论", "共", "条评论", "回复"
     )
+
+    /** 评论输入框 hint 文本（用于定位评论输入框） */
+    val COMMENT_INPUT_HINTS: List<String> = listOf(
+        "说点什么", "发表评论", "想说", "评论", "写评论", "输入评论"
+    )
+
+    /** 发送按钮文本（用于定位发送按钮） */
+    val COMMENT_SEND_TEXTS: List<String> = listOf(
+        "发送", "发布", "发送评论", "发表"
+    )
+
+    /** 自动评论内容池（正能量句子，随机抽取一条发送） */
+    val POSITIVE_COMMENTS: List<String> = listOf(
+        "拍得真好，看完心情都变好了",
+        "太治愈了，感谢分享",
+        "满满的正能量，收藏了",
+        "内容很棒，越看越喜欢",
+        "这才是生活的美好",
+        "看完收获满满，加油",
+        "用心记录生活的样子真美",
+        "每天刷到这样的视频就很开心",
+        "温暖又有力量，赞一个",
+        "太喜欢这个氛围了，治愈满分"
+    )
+
+    /** 评论按钮排除文本（避免误匹配页面中的其他「评论」文字） */
+    val COMMENT_BUTTON_EXCLUDE: List<String> = listOf(
+        "评论列表", "评论内容", "评论数", "条评论", "评论中", "评论详情", "查看评论"
+    )
 }

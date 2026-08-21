@@ -182,7 +182,11 @@ private fun FilterBar(
                     label = { Text("全部") },
                     leadingIcon = {
                         if (currentFilter == null) {
-                            Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
                         }
                     }
                 )
@@ -191,7 +195,11 @@ private fun FilterBar(
                     onClick = { onFilterChange(OperationType.SCAN) },
                     label = { Text("扫描") },
                     leadingIcon = {
-                        Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Default.Search,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 )
                 FilterChip(
@@ -199,7 +207,11 @@ private fun FilterBar(
                     onClick = { onFilterChange(OperationType.COMMENT) },
                     label = { Text("评论") },
                     leadingIcon = {
-                        Icon(Icons.Default.Comment, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Default.Comment,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 )
                 FilterChip(
@@ -207,7 +219,11 @@ private fun FilterBar(
                     onClick = { onFilterChange(OperationType.FOLLOW) },
                     label = { Text("关注") },
                     leadingIcon = {
-                        Icon(Icons.Default.PersonAdd, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Default.PersonAdd,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 )
                 FilterChip(
@@ -215,7 +231,11 @@ private fun FilterBar(
                     onClick = { onFilterChange(OperationType.ANALYZE) },
                     label = { Text("分析") },
                     leadingIcon = {
-                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 )
                 FilterChip(
@@ -223,7 +243,11 @@ private fun FilterBar(
                     onClick = { onFilterChange(OperationType.LIKE) },
                     label = { Text("点赞") },
                     leadingIcon = {
-                        Icon(Icons.Default.Favorite, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Default.Favorite,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 )
                 FilterChip(
@@ -231,7 +255,11 @@ private fun FilterBar(
                     onClick = { onFilterChange(OperationType.COLLECT) },
                     label = { Text("收藏") },
                     leadingIcon = {
-                        Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Default.Bookmark,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                 )
             }
@@ -262,6 +290,7 @@ private fun LogItem(log: OperationLogEntity, onOpenVideo: () -> Unit) {
         OperationType.ANALYZE -> Icons.Default.AutoAwesome to Primary
         OperationType.LIKE -> Icons.Default.Favorite to StatusRed
         OperationType.COLLECT -> Icons.Default.Bookmark to IntentOrange
+        OperationType.SEND_COMMENT -> TODO()
     }
 
     val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
@@ -401,4 +430,7 @@ private fun actionLabel(action: OperationType): String = when (action) {
     OperationType.ANALYZE -> "分析"
     OperationType.LIKE -> "点赞"
     OperationType.COLLECT -> "收藏"
+    else -> {
+        "-"
+    }
 }

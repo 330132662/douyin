@@ -318,6 +318,12 @@ private fun StatsCard(stats: DouyinAccessibilityService.Stats) {
                     value = stats.collectedCount.toString(),
                     color = IntentOrange
                 )
+                StatItem(
+                    icon = Icons.Default.Chat,
+                    label = "已评论",
+                    value = stats.commentCount.toString(),
+                    color = IntentOrange
+                )
             }
         }
     }

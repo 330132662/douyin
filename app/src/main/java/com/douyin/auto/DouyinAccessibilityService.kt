@@ -7,6 +7,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Bundle
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -62,6 +63,7 @@ class DouyinAccessibilityService : AccessibilityService() {
         val analyzedCount: Int = 0,
         val likedCount: Int = 0,
         val collectedCount: Int = 0,
+        val commentCount: Int = 0,
         val lastScanTime: Long = 0L
     )
 
@@ -134,6 +136,9 @@ class DouyinAccessibilityService : AccessibilityService() {
 
     @Volatile
     private var collectedCount: Int = 0
+
+    @Volatile
+    private var commentCount: Int = 0
 
     /** 视频内容分析编排器 */
     private lateinit var videoAnalyzer: VideoContentAnalyzer
@@ -441,7 +446,7 @@ class DouyinAccessibilityService : AccessibilityService() {
 
     /** 可附带视频链接的操作类型（点击日志可跳转到该视频） */
     private val VIDEO_ACTIONS_WITH_LINK = setOf(
-        OperationType.ANALYZE, OperationType.LIKE, OperationType.COLLECT
+        OperationType.ANALYZE, OperationType.LIKE, OperationType.COLLECT, OperationType.SEND_COMMENT
     )
 
     private fun notifyStats() {
@@ -453,6 +458,7 @@ class DouyinAccessibilityService : AccessibilityService() {
                 analyzedCount = analyzedCount,
                 likedCount = likedCount,
                 collectedCount = collectedCount,
+                commentCount = commentCount,
                 lastScanTime = lastScanTime
             )
         )
@@ -468,6 +474,7 @@ class DouyinAccessibilityService : AccessibilityService() {
         analyzedCount = 0
         likedCount = 0
         collectedCount = 0
+        commentCount = 0
         notifyStats()
     }
 
@@ -482,6 +489,7 @@ class DouyinAccessibilityService : AccessibilityService() {
             analyzedCount = analyzedCount,
             likedCount = likedCount,
             collectedCount = collectedCount,
+            commentCount = commentCount,
             lastScanTime = lastScanTime
         )
     }
@@ -692,6 +700,190 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         for (n in all) if (n != root && n != star) n.recycle()
         return star
+    }
+
+    /**
+     * 定位视频页的评论按钮。
+     *
+     * 抖音右侧竖排操作栏（从上到下）：头像 → 赞 → 评论 → 收藏 → 分享。
+     * 关键：评论按钮是「聊天气泡图标」，部分版本 contentDescription/text 里不含「评论」二字，
+     * 纯文字匹配会失败。因此采用多级策略：
+     *
+     * 1. 文字/描述直接含「评论」→ 向上回溯可点击祖先 → 右栏校验（x ≥ 60% 屏宽）；
+     * 2. 「收藏」按钮正上方锚点：收藏按钮有文字（已验证），评论紧贴收藏上方，
+     *    取右栏中 y 坐标小于收藏、且最靠近收藏的可点击图标；
+     * 3. 兜底：「赞」与「分享」可点击祖先之间最靠上的右栏按钮。
+     *
+     * 评论区面板打开时右栏被遮挡/不可见，此方法返回 null，
+     * 从而避免在面板内误点「全部评论」等文本节点。
+     */
+    private fun findCommentButtonByPosition(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels
+        val railLeft = (w * 0.60f).toInt()   // 右栏起点（留余量防误判）
+
+        // 单次遍历收集整棵树节点引用并记录父子关系（便于向上回溯祖先）
+        val all = ArrayList<AccessibilityNodeInfo>()
+        val parentOf = HashMap<AccessibilityNodeInfo, AccessibilityNodeInfo?>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        all.add(root)
+        parentOf[root] = null
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            repeat(node.childCount) { i ->
+                node.getChild(i)?.let { child ->
+                    all.add(child)
+                    parentOf[child] = node
+                    queue.add(child)
+                }
+            }
+        }
+
+        fun labelOf(n: AccessibilityNodeInfo): String = buildString {
+            append(n.text?.toString() ?: "")
+            append(" ")
+            append(n.contentDescription?.toString() ?: "")
+        }.lowercase()
+
+        fun clickableAncestorOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+            var cur: AccessibilityNodeInfo? = n
+            while (cur != null) {
+                if (cur.isClickable) return cur
+                cur = parentOf[cur]
+            }
+            return null
+        }
+
+        fun cxOf(n: AccessibilityNodeInfo): Int {
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            return r.centerX()
+        }
+
+        fun cyOf(n: AccessibilityNodeInfo): Int {
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            return r.centerY()
+        }
+
+        var chosen: AccessibilityNodeInfo? = null
+
+        // 0) 纯几何定位（图标按钮无文字/描述时的主力方案）：
+        //    收集右栏所有可点击节点，按 y 聚类合并同按钮的重复节点，
+        //    从底部往上第 3 个即「评论」（底部三个稳定为 评论→收藏→分享）。
+        run {
+            val railClickables = all
+                .filter { it.isClickable && cxOf(it) >= railLeft }
+                .sortedBy { cyOf(it) }
+            val groups = ArrayList<AccessibilityNodeInfo>()
+            var lastCy = -100000
+            for (c in railClickables) {
+                val cy = cyOf(c)
+                if (groups.isEmpty() || cy - lastCy > 60) {
+                    groups.add(c)
+                    lastCy = cy
+                }
+            }
+            if (groups.size >= 3) {
+                chosen = groups[groups.size - 3]
+                Log.d(TAG, "评论按钮几何定位命中：右栏可点击组数=${groups.size}, 选定组cy=${cyOf(chosen!!)}")
+            } else {
+                Log.d(TAG, "评论按钮几何定位失败：右栏可点击组数=${groups.size}")
+            }
+        }
+
+        // 1) 文字/描述含「评论」→ 可点击祖先 → 右栏校验
+        if (chosen == null) {
+            for (n in all) {
+                if ("评论" !in labelOf(n)) continue
+                val anc = clickableAncestorOf(n) ?: continue
+                if (cxOf(anc) >= railLeft) {
+                    chosen = anc
+                    break
+                }
+            }
+        }
+
+        // 2) 「收藏」按钮正上方锚点（评论图标紧贴收藏上方，不依赖评论文字）
+        if (chosen == null) {
+            val collectAnc = all.firstOrNull { "收藏" in labelOf(it) }
+                ?.let { clickableAncestorOf(it) }
+            if (collectAnc != null) {
+                val collectY = cyOf(collectAnc)
+                chosen = all
+                    .filter { it.isClickable && cxOf(it) >= railLeft && cyOf(it) in 0 until collectY }
+                    .maxByOrNull { cyOf(it) }
+            }
+        }
+
+        // 3) 兜底：「赞」与「分享」可点击祖先之间最靠上的右栏按钮
+        if (chosen == null) {
+            val like = all.firstOrNull { "赞" in labelOf(it) }?.let { clickableAncestorOf(it) }
+            val share = all.firstOrNull { "分享" in labelOf(it) || "转发" in labelOf(it) }
+                ?.let { clickableAncestorOf(it) }
+            if (like != null && share != null) {
+                val likeY = cyOf(like)
+                val shareY = cyOf(share)
+                if (shareY > likeY) {
+                    chosen = all
+                        .filter { it.isClickable && cxOf(it) >= railLeft && cyOf(it) in (likeY + 1 until shareY) }
+                        .minByOrNull { cyOf(it) }
+                }
+            }
+        }
+
+        for (n in all) if (n != root && n != chosen) n.recycle()
+        return chosen
+    }
+
+    /**
+     * 诊断用：收集右栏区域（x ≥ 60% 屏宽）内的节点详情，
+     * 用于评论按钮定位失败时输出到日志，便于对照真实节点结构调整定位策略。
+     * 输出格式：`[cy=坐标,id=资源id简称,cls=类名简称,desc=描述,text=文本,click]`
+     * 图标按钮无文字时也应输出（这是纯图标场景的关键诊断依据）。
+     */
+    private fun describeRightRail(root: AccessibilityNodeInfo): String {
+        val dm = resources.displayMetrics
+        val railLeft = (dm.widthPixels * 0.60f).toInt()
+        val sb = StringBuilder()
+        val all = ArrayList<AccessibilityNodeInfo>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        all.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            repeat(node.childCount) { i ->
+                node.getChild(i)?.let { child ->
+                    all.add(child)
+                    queue.add(child)
+                }
+            }
+        }
+        var count = 0
+        for (node in all) {
+            if (count >= 40) break
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            if (r.centerX() < railLeft) continue
+            val id = node.viewIdResourceName?.substringAfterLast('/') ?: ""
+            val cls = node.className?.toString()?.substringAfterLast('.') ?: ""
+            val desc = (node.contentDescription?.toString() ?: "").take(12)
+            val text = (node.text?.toString() ?: "").take(12)
+            // 仅保留可点击节点，或带文字/描述/资源id的节点
+            val interesting = node.isClickable || desc.isNotEmpty() || text.isNotEmpty() || id.isNotEmpty()
+            if (!interesting) continue
+            sb.append("[cy=").append(r.centerY())
+                .append(",id=").append(id)
+                .append(",cls=").append(cls)
+                .append(",desc=").append(desc)
+                .append(",text=").append(text)
+                .append(if (node.isClickable) ",CLICK" else "")
+                .append("]")
+            count++
+        }
+        for (n in all) if (n != root) n.recycle()
+        return sb.toString()
     }
 
     /**
@@ -910,6 +1102,221 @@ class DouyinAccessibilityService : AccessibilityService() {
         val stroke = GestureDescription.StrokeDescription(path, 0, 60)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         return runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
+    }
+
+    // ---- 自动评论 ----
+
+    /**
+     * 对当前视频执行评论：打开评论区 → 粘贴随机正能量句子 → 延迟1秒 → 点击提交 →
+     * 延迟1秒 → 关闭评论区（切换下一视频由主循环负责）。
+     *
+     * 流程：
+     * 0. 若评论区已打开（输入框已可见，如用户手动点开），跳过点按钮直接进入输入；
+     * 1. 按「右栏位置」定位评论按钮并点击（避免误匹配面板内「全部评论」等文本）；
+     * 2. 等待评论区面板出现，定位评论输入框（优先 hint 匹配，否则取屏幕最底部的输入框）；
+     * 3. 聚焦 → ACTION_SET_TEXT 写入；失败则剪贴板 + ACTION_PASTE 粘贴兜底；
+     * 4. 延迟 1 秒，找到提交按钮并点击；
+     * 5. 延迟 1 秒，按返回键关闭评论区面板。
+     *
+     * 任何环节失败均不阻塞主流程，记录日志后跳过。
+     */
+    private suspend fun performComment(): Boolean {
+        val commentText = IntentKeywords.POSITIVE_COMMENTS.random()
+
+        // 0) 检测评论区是否已打开（输入框已可见）
+        val root0 = rootInActiveWindow
+        var panelOpen = false
+        if (root0 != null) {
+            try {
+                panelOpen = findInputFieldInRoot(root0) != null
+            } finally {
+                root0.recycle()
+            }
+        }
+
+        if (!panelOpen) {
+            // 1) 按「右栏位置」定位评论按钮并点击
+            val root1 = rootInActiveWindow ?: return false
+            var commentBtn: AccessibilityNodeInfo? = null
+            var btnCx = 0
+            var btnCy = 0
+            try {
+                commentBtn = findCommentButtonByPosition(root1)
+                if (commentBtn == null) {
+                    // 无障碍拿不到评论按钮节点（纯图标无描述）→ 坐标硬点兜底
+                    val diag = describeRightRail(root1)
+                    Log.w(TAG, "评论按钮定位失败，右栏节点摘要: $diag")
+                    val dm = resources.displayMetrics
+                    btnCx = (dm.widthPixels * 0.875f).toInt()
+                    btnCy = (dm.heightPixels * 0.75f).toInt()
+                    Log.d(TAG, "使用坐标硬点点击评论按钮 ($btnCx, $btnCy)")
+                    dispatchTap(btnCx, btnCy)
+                } else {
+                    // 提前保存按钮中心坐标（节点回收后无法再获取）
+                    val r = Rect()
+                    commentBtn.getBoundsInScreen(r)
+                    btnCx = r.centerX()
+                    btnCy = r.centerY()
+
+                    val clicked = commentBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    if (!clicked) {
+                        // 无障碍点击无响应，回退到手势点击
+                        Log.d(TAG, "评论按钮无障碍点击无响应，回退手势点击 ($btnCx, $btnCy)")
+                        dispatchTap(btnCx, btnCy)
+                    }
+                }
+            } finally {
+                commentBtn?.recycle()
+                root1.recycle()
+            }
+            delay(1000)
+        }
+
+        // 2) 定位评论输入框（最多 3s）
+        val inputNode = waitForInputField(timeoutMs = 3000)
+        if (inputNode == null) {
+            addLog(OperationLog.sendCommentLog(false, "未找到评论输入框"))
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(500)
+            return false
+        }
+
+        // 3) 聚焦 → 写入文字；失败则剪贴板粘贴兜底
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val bundle = Bundle()
+        bundle.putCharSequence(
+            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, commentText
+        )
+        var textOk = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, bundle)
+        if (!textOk) {
+            // SET_TEXT 失败：写入剪贴板后用 ACTION_PASTE 真正「粘贴」
+            runCatching {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("comment", commentText))
+                inputNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                textOk = true
+            }
+        }
+        inputNode.recycle()
+        if (!textOk) {
+            addLog(OperationLog.sendCommentLog(false, "写入评论内容失败"))
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(500)
+            return false
+        }
+
+        // 4) 延迟 1 秒后点击提交评论按钮
+        delay(1000)
+        val sendNode = waitForNode(
+            labels = IntentKeywords.COMMENT_SEND_TEXTS, timeoutMs = 3000
+        )
+        if (sendNode == null) {
+            addLog(OperationLog.sendCommentLog(false, "未找到提交按钮"))
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(500)
+            return false
+        }
+        val sendClicked = sendNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        sendNode.recycle()
+        if (!sendClicked) {
+            addLog(OperationLog.sendCommentLog(false, "提交按钮点击无响应"))
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(500)
+            return false
+        }
+
+        // 5) 延迟 1 秒后关闭评论区（主循环随后切换下一视频）
+        delay(1000)
+        performGlobalAction(GLOBAL_ACTION_BACK)
+
+        commentCount++
+        addLog(OperationLog.sendCommentLog(true, "评论内容：$commentText"))
+        notifyStats()
+        return true
+    }
+
+    /**
+     * 在当前节点树中查找评论输入框（EditText）。
+     *
+     * 评论区面板内可能存在多个输入框（如顶部的「搜索评论」框、底部的评论输入条），
+     * 直接取第一个会命中搜索框导致文字打错位置。选择策略：
+     * 1. 优先取 hint 命中 [IntentKeywords.COMMENT_INPUT_HINTS]（如「说点什么」）的输入框；
+     * 2. 否则取屏幕位置最靠底部的输入框（评论输入条固定在面板底部）。
+     *
+     * 调用方负责 recycle 返回的节点。
+     */
+    private fun findInputFieldInRoot(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val all = ArrayList<AccessibilityNodeInfo>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        all.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            repeat(node.childCount) { i ->
+                node.getChild(i)?.let { child ->
+                    all.add(child)
+                    queue.add(child)
+                }
+            }
+        }
+
+        var result: AccessibilityNodeInfo? = null
+        // 1) hint 命中评论输入提示词
+        for (n in all) {
+            val cn = n.className?.toString() ?: ""
+            if (!cn.contains("EditText") || !n.isVisibleToUser) continue
+            val hintText = buildString {
+                append(n.hintText?.toString() ?: "")
+                append(" ")
+                append(n.text?.toString() ?: "")
+                append(" ")
+                append(n.contentDescription?.toString() ?: "")
+            }.lowercase()
+            if (IntentKeywords.COMMENT_INPUT_HINTS.any { it.lowercase() in hintText }) {
+                result = n
+                break
+            }
+        }
+        // 2) 兜底：取屏幕最底部的可见 EditText（评论输入条在面板底部）
+        if (result == null) {
+            var bestCy = -1
+            for (n in all) {
+                val cn = n.className?.toString() ?: ""
+                if (!cn.contains("EditText") || !n.isVisibleToUser) continue
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() > bestCy) {
+                    bestCy = r.centerY()
+                    result = n
+                }
+            }
+        }
+
+        for (n in all) {
+            if (n != root && n != result) n.recycle()
+        }
+        return result
+    }
+
+    /**
+     * 轮询当前节点树，等待出现用户可见的 EditText 输入框。
+     * 用于评论区打开后定位输入框。
+     */
+    private suspend fun waitForInputField(timeoutMs: Long): AccessibilityNodeInfo? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val root = rootInActiveWindow
+            if (root != null) {
+                try {
+                    val input = findInputFieldInRoot(root)
+                    if (input != null) return input
+                } finally {
+                    root.recycle()
+                }
+            }
+            delay(200)
+        }
+        return null
     }
 
     /**
@@ -1152,7 +1559,7 @@ class DouyinAccessibilityService : AccessibilityService() {
     /**
      * 分析当前视频并按配置决定是否点赞/收藏，最后提示用户决策结果。
      */
-    private suspend fun analyzeAndAct(identity: String) {
+    private suspend fun analyzeAndAct(identity: String, analysisEnabled: Boolean) {
         // 每条视频开始：重置链接，避免残留上一条视频的分享链接
         currentVideoLink = null
         // 直播场景：直接跳过，不调用大模型、不点赞/收藏
@@ -1172,34 +1579,45 @@ class DouyinAccessibilityService : AccessibilityService() {
                 root.recycle()
             }
         }
-        addLog(OperationLog.statusLog("散步模式", "正在分析视频：$identity"))
-        // 取当前视频分享链接（弹分享面板→复制链接→读剪贴板→关闭面板），供视频级日志点击跳转。
-        // 失败不阻塞主流程，视频级日志将无链落盘（仍可查看，只是不可跳转）。
-        currentVideoLink = runCatching { captureCurrentVideoShareLink() }.getOrNull()
-        if (currentVideoLink == null) {
-            addLog(OperationLog.statusLog("取链", "未能获取本视频分享链接，日志将无法跳转"))
+        if (analysisEnabled) {
+            addLog(OperationLog.statusLog("散步模式", "正在分析视频：$identity"))
+            // 取当前视频分享链接（弹分享面板→复制链接→读剪贴板→关闭面板），供视频级日志点击跳转。
+            // 失败不阻塞主流程，视频级日志将无链落盘（仍可查看，只是不可跳转）。
+            currentVideoLink = runCatching { captureCurrentVideoShareLink() }.getOrNull()
+            if (currentVideoLink == null) {
+                addLog(OperationLog.statusLog("取链", "未能获取本视频分享链接，日志将无法跳转"))
+            }
         }
-        val result = try {
-            videoAnalyzer.analyze()
-        } catch (e: Exception) {
-            Log.e(TAG, "分析异常: ${e.message}", e)
-            addLog(OperationLog.analyzeLog("", false, false, "分析出错：${e.message}"))
-            notifyUser("分析失败：${e.message}")
-            return
+        val result = if (analysisEnabled) {
+            try {
+                videoAnalyzer.analyze()
+            } catch (e: Exception) {
+                Log.e(TAG, "分析异常: ${e.message}", e)
+                addLog(OperationLog.analyzeLog("", false, false, "分析出错：${e.message}"))
+                notifyUser("分析失败：${e.message}")
+                return
+            }
+        } else {
+            // 分析未启用：跳过 VLM 调用与取链，空结果（不点赞/不收藏，评论仍可独立执行）
+            com.douyin.auto.model.VideoAnalysisResult(reason = "分析未启用")
         }
 
-        analyzedCount++
-        addLog(
-            OperationLog.analyzeLog(
-                result.subject, result.shouldLike, result.shouldCollect, result.reason
+        if (analysisEnabled) {
+            analyzedCount++
+            addLog(
+                OperationLog.analyzeLog(
+                    result.subject, result.shouldLike, result.shouldCollect, result.reason
+                )
             )
-        )
-        notifyStats()
+            notifyStats()
+        }
 
         val auto = prefs.autoExecuteFlow.first()
+        val autoComment = prefs.autoCommentFlow.first()
         val limitReached = prefs.isDailyActionLimitReached()
         var didLike = false
         var didCollect = false
+        var didComment = false
         if (auto && !limitReached) {
             if (result.shouldLike) {
                 delay(400)
@@ -1218,10 +1636,19 @@ class DouyinAccessibilityService : AccessibilityService() {
                 }
             }
         }
+        // 评论独立于点赞/收藏开关，不受 VLM 分析结果约束，只要开关打开就评论
+        if (autoComment && !limitReached) {
+            delay(500)
+            didComment = performComment()
+            if (didComment) {
+                prefs.recordAction()
+                notifyStats()
+            }
+        }
         // 提示用户本视频的决策结果
-        notifyUser(buildDecisionMessage(result, auto, didLike, didCollect, limitReached))
+        notifyUser(buildDecisionMessage(result, auto, didLike, didCollect, limitReached, didComment, autoComment))
         // 若已达到每日操作上限，停止自动操作并结束散步模式（避免空转与风控）
-        if (auto && limitReached) {
+        if ((auto || autoComment) && limitReached) {
             addLog(
                 OperationLog.statusLog(
                     "散步模式",
@@ -1239,7 +1666,9 @@ class DouyinAccessibilityService : AccessibilityService() {
         auto: Boolean,
         didLike: Boolean,
         didCollect: Boolean,
-        limitReached: Boolean = false
+        limitReached: Boolean = false,
+        didComment: Boolean = false,
+        autoComment: Boolean = false
     ): String {
         val subj = result.subject.ifEmpty { "（无主体）" }
         val action = buildString {
@@ -1261,6 +1690,11 @@ class DouyinAccessibilityService : AccessibilityService() {
                         else -> "收藏失败"
                     }
                 )
+            }
+            // 评论 — 独立于分析结果，开关打开即显示状态
+            if (autoComment) {
+                if (isNotEmpty()) append(" · ")
+                append(if (didComment) "已评论" else "评论失败")
             }
             if (isEmpty()) append("已跳过（不符合条件）")
             if (limitReached) {
@@ -1293,11 +1727,11 @@ class DouyinAccessibilityService : AccessibilityService() {
                         delay(500)
                         continue
                     }
-                    if (!prefs.analysisEnabledFlow.first()) {
-                        delay(1000)
-                        continue
-                    }
-                    if (!ScreenCaptureService.isAvailable()) {
+                    // 分析开关与评论开关互相独立，任一组合都持续刷视频，绝不空转：
+                    // 分析开→截帧分析；评论开→自动评论；都关→纯散步只刷视频
+                    val analysisEnabled = prefs.analysisEnabledFlow.first()
+                    if (!analysisEnabled && keepAliveStarted) stopKeepAlive()
+                    if (analysisEnabled && !ScreenCaptureService.isAvailable()) {
                         if (keepAliveStarted) stopKeepAlive()
                         val now = System.currentTimeMillis()
                         if (now - lastCaptureMissingLog > 10_000) {
@@ -1316,7 +1750,8 @@ class DouyinAccessibilityService : AccessibilityService() {
                         continue
                     }
                     // 已授权：确保保活 Activity 在运行（切到抖音后 App 退后台会被系统停止录屏）
-                    if (!keepAliveStarted) startKeepAlive()
+                    // 仅在需要截帧分析时保活；纯评论模式无需录屏
+                    if (analysisEnabled && !keepAliveStarted) startKeepAlive()
                     if (isAnalyzingVideo) {
                         delay(500)
                         continue
@@ -1362,7 +1797,7 @@ class DouyinAccessibilityService : AccessibilityService() {
                                 // 刷到新视频：抓取前 10 秒随机几帧 → 分析 → 自动点赞/收藏 → 提示 → 切下一个
                                 lastVideoIdentity = identity
                                 isAnalyzingVideo = true
-                                analyzeAndAct(identity)
+                                analyzeAndAct(identity, analysisEnabled)
                                 isAnalyzingVideo = false
                                 advanceToNextVideo()
                                 lastAdvanceTime = System.currentTimeMillis()

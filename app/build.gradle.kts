@@ -1,4 +1,6 @@
 // 抖音获客助手 - 模块级构建脚本
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -6,7 +8,7 @@ plugins {
 }
 
 // 读取签名配置（app/signing.properties，不入库）
-val signingProps = java.util.Properties().apply {
+val signingProps = Properties().apply {
     val propsFile = file("signing.properties")
     if (propsFile.exists()) {
         propsFile.inputStream().use { load(it) }
@@ -29,19 +31,24 @@ android {
         }
     }
 
-    signingConfigs {
-        create("config") {
-            storeFile = file(signingProps.getProperty("STORE_FILE", ""))
-            storePassword = signingProps.getProperty("STORE_PASSWORD", "")
-            keyAlias = signingProps.getProperty("KEY_ALIAS", "")
-            keyPassword = signingProps.getProperty("KEY_PASSWORD", "")
+    val hasSigningConfig = signingProps.getProperty("STORE_FILE", "").isNotBlank()
+    if (hasSigningConfig) {
+        signingConfigs {
+            create("config") {
+                storeFile = file(signingProps.getProperty("STORE_FILE", ""))
+                storePassword = signingProps.getProperty("STORE_PASSWORD", "")
+                keyAlias = signingProps.getProperty("KEY_ALIAS", "")
+                keyPassword = signingProps.getProperty("KEY_PASSWORD", "")
+            }
         }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("config")
+            if (hasSigningConfig) {
+                signingConfig = signingConfigs.getByName("config")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

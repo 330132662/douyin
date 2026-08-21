@@ -45,6 +45,7 @@ fun ModelSettingsScreen(
     var modelName by remember { mutableStateOf("") }
     var analysisEnabled by remember { mutableStateOf(false) }
     var autoExecute by remember { mutableStateOf(true) }
+    var autoComment by remember { mutableStateOf(false) }
     var likeCriteria by remember { mutableStateOf("") }
     var collectCriteria by remember { mutableStateOf("") }
     var frameCount by remember { mutableStateOf("3") }
@@ -60,6 +61,7 @@ fun ModelSettingsScreen(
     LaunchedEffect(Unit) { prefs.modelNameFlow.collect { modelName = it } }
     LaunchedEffect(Unit) { prefs.analysisEnabledFlow.collect { analysisEnabled = it } }
     LaunchedEffect(Unit) { prefs.autoExecuteFlow.collect { autoExecute = it } }
+    LaunchedEffect(Unit) { prefs.autoCommentFlow.collect { autoComment = it } }
     LaunchedEffect(Unit) { prefs.likeCriteriaFlow.collect { likeCriteria = it } }
     LaunchedEffect(Unit) { prefs.collectCriteriaFlow.collect { collectCriteria = it } }
     LaunchedEffect(Unit) { prefs.frameCountFlow.collect { frameCount = it.toString() } }
@@ -143,6 +145,22 @@ fun ModelSettingsScreen(
                     Switch(checked = autoExecute, onCheckedChange = {
                         autoExecute = it
                         scope.launch { prefs.setAutoExecute(it) }
+                    })
+                }
+            }
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("自动评论", fontWeight = FontWeight.Medium)
+                        Text(
+                            "判定命中后由无障碍服务自动输入随机评论（关闭则仅点赞/收藏）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(checked = autoComment, onCheckedChange = {
+                        autoComment = it
+                        scope.launch { prefs.setAutoComment(it) }
                     })
                 }
             }

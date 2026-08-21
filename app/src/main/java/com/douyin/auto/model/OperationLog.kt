@@ -19,7 +19,9 @@ enum class OperationType {
     /** 点赞视频 */
     LIKE,
     /** 收藏视频 */
-    COLLECT
+    COLLECT,
+    /** 发送评论 */
+    SEND_COMMENT
 }
 
 /**
@@ -169,8 +171,17 @@ data class OperationLog(
         }
 
         /**
-         * 创建一条收藏日志
+         * 创建一条发送评论日志
          */
+        fun sendCommentLog(success: Boolean, detail: String = ""): OperationLog {
+            return OperationLog(
+                action = OperationType.SEND_COMMENT,
+                target = "当前视频",
+                result = if (success) "成功" else "失败",
+                detail = if (detail.isNotEmpty()) detail else if (success) "已发送评论" else "发送评论未成功"
+            )
+        }
+
         fun collectLog(success: Boolean, reason: String = ""): OperationLog {
             return OperationLog(
                 action = OperationType.COLLECT,

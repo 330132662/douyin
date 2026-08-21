@@ -70,6 +70,9 @@ class AppPreferences(private val context: Context) {
         /** 判定命中后是否自动点赞/收藏 */
         val KEY_AUTO_EXECUTE = booleanPreferencesKey("auto_execute")
 
+        /** 判定命中后是否自动评论 */
+        val KEY_AUTO_COMMENT = booleanPreferencesKey("auto_comment")
+
         /** 点赞条件（自然语言描述） */
         val KEY_LIKE_CRITERIA = stringPreferencesKey("like_criteria")
 
@@ -178,6 +181,11 @@ class AppPreferences(private val context: Context) {
     /** 自动执行（点赞/收藏）Flow */
     val autoExecuteFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
         prefs[KEY_AUTO_EXECUTE] ?: true
+    }
+
+    /** 自动评论 Flow */
+    val autoCommentFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[KEY_AUTO_COMMENT] ?: false
     }
 
     /** 点赞条件 Flow */
@@ -315,6 +323,13 @@ class AppPreferences(private val context: Context) {
     suspend fun setAutoExecute(enabled: Boolean) {
         context.dataStore.edit { prefs ->
             prefs[KEY_AUTO_EXECUTE] = enabled
+        }
+    }
+
+    /** 设置是否自动评论 */
+    suspend fun setAutoComment(enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_AUTO_COMMENT] = enabled
         }
     }
 
