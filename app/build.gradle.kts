@@ -5,6 +5,14 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+// 读取签名配置（app/signing.properties，不入库）
+val signingProps = java.util.Properties().apply {
+    val propsFile = file("signing.properties")
+    if (propsFile.exists()) {
+        propsFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     namespace = "com.douyin.auto"
     compileSdk = 34
@@ -21,9 +29,19 @@ android {
         }
     }
 
+    signingConfigs {
+        create("config") {
+            storeFile = file(signingProps.getProperty("STORE_FILE", ""))
+            storePassword = signingProps.getProperty("STORE_PASSWORD", "")
+            keyAlias = signingProps.getProperty("KEY_ALIAS", "")
+            keyPassword = signingProps.getProperty("KEY_PASSWORD", "")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("config")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

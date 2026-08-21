@@ -2,3 +2,7 @@
 /.idea/*
 app/build/
 app/release
+# 签名配置与密钥库（含敏感信息，禁止入库）
+app/signing.properties
+**/*.keystore
+**/*.jks
