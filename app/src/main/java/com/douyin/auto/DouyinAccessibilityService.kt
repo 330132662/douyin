@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import java.util.ArrayDeque
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
@@ -102,6 +103,9 @@ class DouyinAccessibilityService : AccessibilityService() {
 
         /** 双击两次点按之间的间隔（ms），合计需 < 系统双击阈值(约300ms) */
         private const val DOUBLE_TAP_GAP_MS = 90L
+
+        /** 右侧栏单按钮高度（px），用于坐标兜底把定位点下移一个按钮高度以命中评论按钮 */
+        private const val BUTTON_HEIGHT_PX = 200
     }
 
     // ---- 核心组件 ----
@@ -266,10 +270,8 @@ class DouyinAccessibilityService : AccessibilityService() {
         // 显示悬浮操作按钮（小白点）
         floatingDot = FloatingDotManager(
             context = this, actions = listOf(
-                FloatingAction("开始翻页") { startPageFlip() },
-                FloatingAction("暂停翻页") { pausePageFlip() },
-                FloatingAction("继续翻页") { resumePageFlip() },
-                FloatingAction("结束翻页") { stopPageFlip() },
+                FloatingAction("测试·寻找评论按钮") { testFindCommentButton() },
+                FloatingAction("测试·寻找发送按钮") { testFindSendButton() },
                 FloatingAction("滚动到最新评论 (≤100)") { scrollCommentToEnd(100) },
                 FloatingAction("开始散步模式") { startVideoWatch() },
                 FloatingAction("暂停散步") { pauseVideoWatch() },
@@ -703,24 +705,57 @@ class DouyinAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 定位视频页的评论按钮。
+     * 跨窗口、语义锚点定位评论按钮的**点击目标点**（返回屏幕坐标点，不返回节点）。
      *
-     * 抖音右侧竖排操作栏（从上到下）：头像 → 赞 → 评论 → 收藏 → 分享。
-     * 关键：评论按钮是「聊天气泡图标」，部分版本 contentDescription/text 里不含「评论」二字，
-     * 纯文字匹配会失败。因此采用多级策略：
+     * 关键设计：不再对评论按钮的可点击节点执行 performAction(CLICK)——抖音右栏
+     * 按钮的可点击祖先常是包住多个按钮的大容器，点击落在容器中心会误中
+     * 点赞/收藏（实际反馈的误点根因）。改为从**语义锚点节点**（有文字/资源 id 的
+     * 赞、收藏按钮）的矩形相对推导目标点，再用手势精确点按：
      *
-     * 1. 文字/描述直接含「评论」→ 向上回溯可点击祖先 → 右栏校验（x ≥ 60% 屏宽）；
-     * 2. 「收藏」按钮正上方锚点：收藏按钮有文字（已验证），评论紧贴收藏上方，
-     *    取右栏中 y 坐标小于收藏、且最靠近收藏的可点击图标；
-     * 3. 兜底：「赞」与「分享」可点击祖先之间最靠上的右栏按钮。
+     * - A. resource-id 含 "comment" 的节点中心（id 语义最稳）；
+     * - B. 文字/描述含「评论」且位于右栏的节点中心（如描述「评论，1234条」）；
+     * - C. 双锚点夹逼（主力）：赞、收藏按钮均有文字可语义识别，右栏固定布局
+     *      「赞 → 评论 → 收藏 → 分享」，取赞按钮底边与收藏按钮顶边的**中点**——
+     *      该点必然落在评论按钮上，且天然不可能是赞/收藏/分享；
+     * - D. 收藏单锚点：评论与收藏同尺寸紧贴堆叠，收藏正上方半个按钮高度处；
+     * - D2. 赞单锚点：评论紧贴赞下方，赞正下方半个按钮高度处。
      *
-     * 评论区面板打开时右栏被遮挡/不可见，此方法返回 null，
-     * 从而避免在面板内误点「全部评论」等文本节点。
+     * 锚点不可识别（纯图标、无文字/描述/id）时返回 null，交给视觉定位兜底。
+     * 所有坐标均由节点矩形相对推导，无绝对屏幕坐标硬编码。
      */
-    private fun findCommentButtonByPosition(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+    private fun findCommentButtonTarget(): Point? {
         val dm = resources.displayMetrics
-        val w = dm.widthPixels
-        val railLeft = (w * 0.60f).toInt()   // 右栏起点（留余量防误判）
+
+        for (window in windows) {
+            val root = window.root
+            if (root == null) {
+                runCatching { window.recycle() }
+                continue
+            }
+            // 只扫描抖音的窗口：排除本服务自建的悬浮覆盖层，防止扫到我们自己的菜单文字
+            // （如「测试·寻找评论按钮」含「评论」二字，会被 B 策略误命中并导致误点自己）。
+            val pkg = root.packageName?.toString() ?: ""
+            val isDouyinWindow = pkg == DOUYIN_PACKAGE || window.title?.toString()?.contains("抖音") == true
+            if (!isDouyinWindow) {
+                root.recycle()
+                runCatching { window.recycle() }
+                continue
+            }
+            val target = scanWindowForCommentTarget(root, dm.widthPixels, dm.heightPixels)
+            runCatching { window.recycle() }
+            if (target != null) return target
+        }
+        return null
+    }
+
+    /** 在单窗口内按 A~D2 策略推导评论按钮的点击目标点；统一回收全部节点。 */
+    private fun scanWindowForCommentTarget(
+        root: AccessibilityNodeInfo,
+        screenW: Int,
+        screenH: Int
+    ): Point? {
+        val railMinX = (screenW * 0.55f).toInt()      // 锚点/id 校验用（稍宽松）
+        val labelRailMinX = (screenW * 0.60f).toInt() // 纯文字校验用（严，防居中 toast 误命中）
 
         // 单次遍历收集整棵树节点引用并记录父子关系（便于向上回溯祖先）
         val all = ArrayList<AccessibilityNodeInfo>()
@@ -746,6 +781,9 @@ class DouyinAccessibilityService : AccessibilityService() {
             append(n.contentDescription?.toString() ?: "")
         }.lowercase()
 
+        fun idOf(n: AccessibilityNodeInfo): String =
+            n.viewIdResourceName?.lowercase() ?: ""
+
         fun clickableAncestorOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
             var cur: AccessibilityNodeInfo? = n
             while (cur != null) {
@@ -767,74 +805,130 @@ class DouyinAccessibilityService : AccessibilityService() {
             return r.centerY()
         }
 
-        var chosen: AccessibilityNodeInfo? = null
+        // 右栏按钮区域：竖直方向限制在屏高 15%~88%，排除顶部头像区与底部音乐转盘
+        val railTopY = (screenH * 0.15f).toInt()
+        val railBottomY = (screenH * 0.88f).toInt()
 
-        // 0) 纯几何定位（图标按钮无文字/描述时的主力方案）：
-        //    收集右栏所有可点击节点，按 y 聚类合并同按钮的重复节点，
-        //    从底部往上第 3 个即「评论」（底部三个稳定为 评论→收藏→分享）。
-        run {
-            val railClickables = all
-                .filter { it.isClickable && cxOf(it) >= railLeft }
-                .sortedBy { cyOf(it) }
-            val groups = ArrayList<AccessibilityNodeInfo>()
-            var lastCy = -100000
-            for (c in railClickables) {
-                val cy = cyOf(c)
-                if (groups.isEmpty() || cy - lastCy > 60) {
-                    groups.add(c)
-                    lastCy = cy
-                }
+        fun isRailNode(n: AccessibilityNodeInfo): Boolean {
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            return r.centerX() >= railMinX && r.centerY() in railTopY..railBottomY
+        }
+
+        fun railAnchorOf(pred: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? =
+            all.filter { it.isVisibleToUser && pred(it) && isRailNode(it) }
+                .minByOrNull { cyOf(it) }
+
+        val favNode = railAnchorOf {
+            "收藏" in labelOf(it) || "favorite" in idOf(it) || "collect" in idOf(it)
+        }
+        val likeNode = railAnchorOf {
+            "赞" in labelOf(it) || "like" in idOf(it) || "zan" in idOf(it) || "praise" in idOf(it)
+        }
+        val commentIdNode = railAnchorOf { "comment" in idOf(it) }
+        val commentTextNode = all.firstOrNull {
+            it.isVisibleToUser && "评论" in labelOf(it) && isRailNode(it)
+        }
+
+        // 诊断日志：各锚点识别结果
+        fun describeAnchor(name: String, n: AccessibilityNodeInfo?): String {
+            if (n == null) return "$name=null"
+            val r = Rect()
+            n.getBoundsInScreen(r)
+            val lb = labelOf(n).ifEmpty { "(空)" }
+            val id = idOf(n).ifEmpty { "(无id)" }
+            return "$name=[$lb|id=$id|cy=${r.centerY()}|cx=${r.centerX()}|h=${r.height()}|w=${r.width()}]"
+        }
+        Log.d(TAG, "评论锚点: ${describeAnchor("赞", likeNode)}, ${describeAnchor("收藏", favNode)}, ${describeAnchor("commentId", commentIdNode)}, ${describeAnchor("评论文本", commentTextNode)}")
+
+        /**
+         * 锚点按钮矩形：优先取尺寸合理的可点击祖先（恰好包住图标+文字的完整按钮）；
+         * 祖先缺失或异常（包住多个按钮的大容器）时，用节点矩形向上扩 2 倍高度近似
+         * （右栏按钮的图标在文字上方）。
+         */
+        fun buttonRectOf(anchor: AccessibilityNodeInfo): Rect {
+            val nodeRect = Rect()
+            anchor.getBoundsInScreen(nodeRect)
+            val anc = clickableAncestorOf(anchor)
+            if (anc != null) {
+                val ar = Rect()
+                anc.getBoundsInScreen(ar)
+                val reasonable = ar.height() <= screenH / 5 &&
+                        ar.width() <= screenW / 4 &&
+                        ar.top <= nodeRect.top && ar.bottom >= nodeRect.bottom
+                if (reasonable) return ar
             }
-            if (groups.size >= 3) {
-                chosen = groups[groups.size - 3]
-                Log.d(TAG, "评论按钮几何定位命中：右栏可点击组数=${groups.size}, 选定组cy=${cyOf(chosen!!)}")
+            return Rect(
+                nodeRect.left, nodeRect.top - nodeRect.height() * 2,
+                nodeRect.right, nodeRect.bottom
+            )
+        }
+
+        var target: Point? = null
+        var hitTag = ""
+
+        // A) resource-id 含 "comment" 的节点中心（节点本身就在评论按钮上）
+        if (target == null && commentIdNode != null) {
+            val r = Rect()
+            commentIdNode.getBoundsInScreen(r)
+            target = Point(r.centerX(), r.centerY())
+            hitTag = "A:comment-id"
+        }
+
+        // B) 文字/描述含「评论」且在右栏的节点中心（如描述「评论，1234条」）
+        if (target == null && commentTextNode != null) {
+            val r = Rect()
+            commentTextNode.getBoundsInScreen(r)
+            target = Point(r.centerX(), r.centerY())
+            hitTag = "B:文字含评论"
+        }
+
+        // C) 双锚点夹逼（主力）：右栏固定布局「赞→评论→收藏→分享」，
+        //    赞按钮底边与收藏按钮顶边的中点必然落在评论按钮上，
+        //    且天然不可能是赞/收藏/分享——从根源上杜绝误点相邻按钮
+        if (target == null && likeNode != null && favNode != null) {
+            val lr = buttonRectOf(likeNode)
+            val fr = buttonRectOf(favNode)
+            val colTol = maxOf(40, minOf(lr.width(), fr.width()) / 2)
+            val sameCol = Math.abs(lr.centerX() - fr.centerX()) <= colTol
+            val likeAboveFav = lr.bottom < fr.top
+            val gap = fr.top - lr.bottom
+            val gapReasonable = gap in 1..(screenH / 6)
+            if (sameCol && likeAboveFav && gapReasonable) {
+                target = Point((lr.centerX() + fr.centerX()) / 2, lr.bottom + gap / 2)
+                hitTag = "C:赞收藏夹逼"
             } else {
-                Log.d(TAG, "评论按钮几何定位失败：右栏可点击组数=${groups.size}")
+                Log.w(TAG, "C策略失败: 同列=$sameCol 赞在收藏上=$likeAboveFav gap=$gap gap合理=$gapReasonable " +
+                    "赞rect=[$lr] 收藏rect=[$fr] colTol=$colTol")
             }
         }
 
-        // 1) 文字/描述含「评论」→ 可点击祖先 → 右栏校验
-        if (chosen == null) {
-            for (n in all) {
-                if ("评论" !in labelOf(n)) continue
-                val anc = clickableAncestorOf(n) ?: continue
-                if (cxOf(anc) >= railLeft) {
-                    chosen = anc
-                    break
-                }
+        // D) 收藏单锚点：评论与收藏同尺寸紧贴堆叠，收藏正上方半个按钮高度处即评论
+        if (target == null && favNode != null) {
+            val fr = buttonRectOf(favNode)
+            val y = fr.top - fr.height() / 2
+            if (y > screenH / 20) {
+                target = Point(fr.centerX(), y)
+                hitTag = "D:收藏上方"
             }
         }
 
-        // 2) 「收藏」按钮正上方锚点（评论图标紧贴收藏上方，不依赖评论文字）
-        if (chosen == null) {
-            val collectAnc = all.firstOrNull { "收藏" in labelOf(it) }
-                ?.let { clickableAncestorOf(it) }
-            if (collectAnc != null) {
-                val collectY = cyOf(collectAnc)
-                chosen = all
-                    .filter { it.isClickable && cxOf(it) >= railLeft && cyOf(it) in 0 until collectY }
-                    .maxByOrNull { cyOf(it) }
+        // D2) 赞单锚点：评论紧贴赞下方，赞正下方半个按钮高度处即评论
+        if (target == null && likeNode != null) {
+            val lr = buttonRectOf(likeNode)
+            val y = lr.bottom + lr.height() / 2
+            if (y < screenH * 19 / 20) {
+                target = Point(lr.centerX(), y)
+                hitTag = "D2:赞下方"
             }
         }
 
-        // 3) 兜底：「赞」与「分享」可点击祖先之间最靠上的右栏按钮
-        if (chosen == null) {
-            val like = all.firstOrNull { "赞" in labelOf(it) }?.let { clickableAncestorOf(it) }
-            val share = all.firstOrNull { "分享" in labelOf(it) || "转发" in labelOf(it) }
-                ?.let { clickableAncestorOf(it) }
-            if (like != null && share != null) {
-                val likeY = cyOf(like)
-                val shareY = cyOf(share)
-                if (shareY > likeY) {
-                    chosen = all
-                        .filter { it.isClickable && cxOf(it) >= railLeft && cyOf(it) in (likeY + 1 until shareY) }
-                        .minByOrNull { cyOf(it) }
-                }
-            }
+        // 目标点为纯数据（无节点引用），统一回收全部节点
+        for (n in all) n.recycle()
+        if (target != null) {
+            Log.d(TAG, "评论按钮目标点命中[$hitTag]: (${target!!.x}, ${target!!.y})")
         }
-
-        for (n in all) if (n != root && n != chosen) n.recycle()
-        return chosen
+        return target
     }
 
     /**
@@ -884,6 +978,242 @@ class DouyinAccessibilityService : AccessibilityService() {
         }
         for (n in all) if (n != root) n.recycle()
         return sb.toString()
+    }
+
+    /**
+     * 诊断用：打印整棵节点树的所有控件信息（全屏，不限于右栏）。
+     * 用于评论按钮定位失败时排查真实节点结构。
+     * 输出每个节点：类名、resource-id、文字、描述、坐标、是否可点击、是否可见。
+     */
+    private fun dumpAllNodes(root: AccessibilityNodeInfo) {
+        val all = ArrayList<AccessibilityNodeInfo>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        all.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            repeat(node.childCount) { i ->
+                node.getChild(i)?.let { child ->
+                    all.add(child)
+                    queue.add(child)
+                }
+            }
+        }
+        Log.d(TAG, "===== 全节点树 dump（共 ${all.size} 个节点）=====")
+        for ((idx, node) in all.withIndex()) {
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            val cls = node.className?.toString() ?: "(无)"
+            val id = node.viewIdResourceName ?: "(无)"
+            val text = (node.text?.toString() ?: "").take(30)
+            val desc = (node.contentDescription?.toString() ?: "").take(30)
+            val visible = if (node.isVisibleToUser) "V" else "H"
+            val clickable = if (node.isClickable) "CLICK" else ""
+            val editable = if (node.isEditable) "EDIT" else ""
+            Log.d(TAG, "[$idx] cls=$cls id=$id text='$text' desc='$desc' " +
+                "rect=[$r] $visible $clickable $editable")
+        }
+        for (n in all) if (n != root) n.recycle()
+        Log.d(TAG, "===== 节点树 dump 结束 =====")
+    }
+
+    /** 当前评论面板是否已打开（真输入框或「说点什么」伪装输入条可见即算）。 */
+    private fun isCommentPanelOpen(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        return try {
+            val bar = findCommentInputBar(root)
+            val open = bar != null
+            bar?.node?.recycle()
+            open
+        } finally {
+            root.recycle()
+        }
+    }
+
+    /**
+     * 【测试】定位当前视频的评论按钮并**直接点击**（不依赖 VLM）。
+     *
+     * 策略：节点优先 + 坐标兜底。
+     * 1. 先打印当前活跃窗口下所有子节点控件 id 与可能的功能
+     *    （resource-id / 文本 / 描述 / 是否可点击，见 [dumpAllNodes]），便于对照结构；
+     * 2. 走语义锚点定位 [findCommentButtonTarget]，命中即手势点按；
+     * 3. 未命中则用屏幕比例坐标兜底点按（右侧栏评论位，约宽 87.5%、高 55%）。
+     */
+    fun testFindCommentButton() {
+        val root = rootInActiveWindow
+        if (root == null) {
+            Log.w(TAG, "【测试】节点遍历定位评论按钮失败：无活跃窗口")
+            addLog(OperationLog.statusLog("测试·评论按钮", "定位失败：无活跃窗口"))
+            return
+        }
+        try {
+            addLog(OperationLog.statusLog("测试·评论按钮", "开始定位并点击当前视频评论按钮…"))
+            // 打印所有子节点控件 id 与可能的功能（resource-id / 文本 / 描述 / 可点击性）
+            dumpAllNodes(root)
+            // 1) 节点优先：公开的无障碍节点遍历
+            val point = findCommentButtonTarget()
+            if (point != null) {
+                Log.d(TAG, "【测试】节点定位评论按钮命中: (${point.x}, ${point.y})，直接点击")
+                addLog(OperationLog.statusLog("测试·评论按钮", "节点定位命中 (${point.x}, ${point.y})，直接点击"))
+                dispatchTap(point.x, point.y)
+                return
+            }
+            // 2) 坐标兜底：节点树为空/未命中时，用右侧栏评论位固定比例坐标点击
+            val dm = resources.displayMetrics
+            val fx = (dm.widthPixels * 0.875f).toInt()
+            // 实测：该比例落在评论按钮上方一个按钮高度处，需下移一个按钮高度才命中评论
+            val fy = (dm.heightPixels * 0.55f).toInt() + BUTTON_HEIGHT_PX
+            Log.w(TAG, "【测试】节点定位未命中，坐标兜底点击 ($fx, $fy)（Y已下移一个按钮高度）")
+            addLog(OperationLog.statusLog("测试·评论按钮", "节点定位失败（见 Logcat dump），坐标兜底点击 ($fx, $fy)"))
+            dispatchTap(fx, fy)
+        } finally {
+            runCatching { root.recycle() }
+        }
+    }
+
+    /**
+     * 【测试】定位评论输入界面的红色「发送」按钮并**直接点击**（不依赖 VLM）。
+     *
+     * 通过跨窗口节点遍历 [findSendButtonInWindows] 锁定输入弹窗底部的「发送」按钮，
+     * 命中后打印其中心坐标并手势点按，方便你判断实际点击位置与按钮的偏移量。
+     */
+    fun testFindSendButton() {
+        addLog(OperationLog.statusLog("测试·发送按钮", "开始定位评论输入界面的发送按钮…"))
+        // 先 dump 当前窗口节点树，排查输入界面的真实控件结构
+        val root = rootInActiveWindow
+        if (root != null) {
+            try { dumpAllNodes(root) } finally { runCatching { root.recycle() } }
+        } else {
+            Log.w(TAG, "【测试】无活跃窗口")
+            addLog(OperationLog.statusLog("测试·发送按钮", "无活跃窗口"))
+            return
+        }
+        val point = findSendTextButton()
+        if (point == null) {
+            Log.w(TAG, "【测试】未找到发送按钮（评论输入界面未打开或节点未暴露）")
+            addLog(OperationLog.statusLog("测试·发送按钮", "未找到发送按钮（请先打开评论输入界面，见 Logcat dump）"))
+            return
+        }
+        Log.d(TAG, "【测试】发送按钮命中: center=(${point.x}, ${point.y})，直接点击")
+        addLog(OperationLog.statusLog("测试·发送按钮", "定位命中 (${point.x}, ${point.y})，直接点击"))
+        dispatchTap(point.x, point.y)
+    }
+
+    /**
+     * 【测试】直接用「发送」文案搜索发送按钮的中心点（不依赖 isClickable / 输入框窗口锁定）。
+     *
+     * 现实里抖音「发送」按钮是不可点击的 TextView（可点击的是其父容器），且键盘弹出后
+     * 输入框被顶到屏幕上半部，原 [findSendButtonInWindows] 的启发式都失效。这里改为：
+     * 遍历抖音窗口所有可见节点，取文字/描述含发送文案且位置最靠下的节点中心。
+     * 同时按包名过滤，排除本服务悬浮菜单「测试·寻找发送按钮」的误匹配。
+     *
+     * @return 发送按钮中心点；未找到返回 null
+     */
+    private fun findSendTextButton(): Point? {
+        var best: Point? = null
+        var bestY = -1
+        for (window in windows) {
+            val root = window.root
+            if (root == null) {
+                runCatching { window.recycle() }
+                continue
+            }
+            val pkg = root.packageName?.toString() ?: ""
+            val isDouyinWindow = pkg == DOUYIN_PACKAGE || window.title?.toString()?.contains("抖音") == true
+            runCatching { window.recycle() }
+            if (!isDouyinWindow) continue
+            val all = ArrayList<AccessibilityNodeInfo>()
+            val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+            all.add(root)
+            while (queue.isNotEmpty()) {
+                val node = queue.removeFirst()
+                repeat(node.childCount) { i ->
+                    node.getChild(i)?.let { child -> all.add(child); queue.add(child) }
+                }
+                if (!node.isVisibleToUser) continue
+                val label = buildString {
+                    append(node.text?.toString() ?: "")
+                    append(" ")
+                    append(node.contentDescription?.toString() ?: "")
+                }.lowercase()
+                if (IntentKeywords.COMMENT_SEND_TEXTS.any { it.lowercase() in label }) {
+                    val r = Rect()
+                    node.getBoundsInScreen(r)
+                    if (r.centerY() > bestY) {
+                        bestY = r.centerY()
+                        best = Point(r.centerX(), r.centerY())
+                    }
+                }
+            }
+            for (n in all) n.recycle()
+        }
+        return best
+    }
+
+    /**
+     * 打开评论面板：节点语义锚点定位评论按钮并手势点击；未命中（节点树为空/纯图标）
+     * 则用右侧栏坐标兜底（宽 87.5%、高 55% + 一个按钮高度）点击。不依赖 VLM。
+     */
+    private suspend fun openCommentPanel() {
+        val point = findCommentButtonTarget()
+        if (point != null) {
+            Log.d(TAG, "评论按钮节点定位命中 (${point.x}, ${point.y})，手势点击")
+            dispatchTap(point.x, point.y)
+            delay(1500)
+            if (isCommentPanelOpen()) return
+        }
+        val dm = resources.displayMetrics
+        val fx = (dm.widthPixels * 0.875f).toInt()
+        val fy = (dm.heightPixels * 0.55f).toInt() + BUTTON_HEIGHT_PX
+        Log.w(TAG, "评论面板未打开，坐标兜底点击 ($fx, $fy)")
+        dispatchTap(fx, fy)
+        delay(2000)
+    }
+
+    /**
+     * 检测当前是否处于直播间上下文（在直播间内，而非普通视频页/评论面板）。
+     *
+     * 判定依据（命中任一即为直播上下文）：
+     * 1. 存在 hint/描述命中 [IntentKeywords.LIVE_INPUT_HINTS]（主播/公屏/弹幕/聊聊…）的
+     *    可编辑节点——直播公屏聊天框的专属特征（评论输入框的 hint 是「说点什么」类，
+     *    不含这些词；评论文本只是 TextView，不会出现在 EditText 的 hint 里）；
+     * 2. 存在文本/描述命中 [IntentKeywords.LIVE_ROOM_TEXTS]（粉丝团/灯牌/公屏）的节点
+     *    ——直播间底部工具栏的专属 UI 文案。
+     *
+     * 用途：评论流程的硬拦截。直播公屏聊天框也是屏幕底部的 EditText，
+     * 若不拦截会被误判为「评论面板已打开」，把预设评论写进直播间并发送出去。
+     */
+    private fun isLiveRoomContext(root: AccessibilityNodeInfo): Boolean {
+        var hit = false
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        while (queue.isNotEmpty() && !hit) {
+            val node = queue.removeFirst()
+            val text = node.text?.toString() ?: ""
+            val desc = node.contentDescription?.toString() ?: ""
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                node.hintText?.toString() ?: ""
+            } else ""
+
+            // 直播间专属 UI 文案（粉丝团/灯牌/公屏）
+            if (IntentKeywords.LIVE_ROOM_TEXTS.any { it in text || it in desc }) {
+                hit = true
+            }
+            // 直播公屏聊天框：可编辑节点且 hint/描述含直播聊天特征词
+            if (!hit && (node.isEditable ||
+                        node.className?.toString()?.contains("EditText") == true)
+            ) {
+                if (IntentKeywords.LIVE_INPUT_HINTS.any { it in hint || it in desc }) {
+                    hit = true
+                }
+            }
+            if (!hit) {
+                repeat(node.childCount) { i -> node.getChild(i)?.let { queue.add(it) } }
+            }
+            if (node != root) node.recycle()
+        }
+        // 清空队列中未处理的节点，避免泄漏
+        while (queue.isNotEmpty()) queue.removeFirst().recycle()
+        return hit
     }
 
     /**
@@ -1099,7 +1429,7 @@ class DouyinAccessibilityService : AccessibilityService() {
      */
     private fun dispatchTap(x: Int, y: Int): Boolean {
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
-        val stroke = GestureDescription.StrokeDescription(path, 0, 60)
+        val stroke = GestureDescription.StrokeDescription(path, 0, 100)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         return runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
     }
@@ -1111,123 +1441,128 @@ class DouyinAccessibilityService : AccessibilityService() {
      * 延迟1秒 → 关闭评论区（切换下一视频由主循环负责）。
      *
      * 流程：
-     * 0. 若评论区已打开（输入框已可见，如用户手动点开），跳过点按钮直接进入输入；
-     * 1. 按「右栏位置」定位评论按钮并点击（避免误匹配面板内「全部评论」等文本）；
-     * 2. 等待评论区面板出现，定位评论输入框（优先 hint 匹配，否则取屏幕最底部的输入框）；
-     * 3. 聚焦 → ACTION_SET_TEXT 写入；失败则剪贴板 + ACTION_PASTE 粘贴兜底；
-     * 4. 延迟 1 秒，找到提交按钮并点击；
-     * 5. 延迟 1 秒，按返回键关闭评论区面板。
+     * 0. 若评论区已打开（输入条已可见，如用户手动点开），跳过点按钮直接进入输入；
+     * 1. 评论按钮多级定位 + 点击后验证闭环：语义锚点定位并手势点按（快路径，
+     *    跨窗口策略：comment-id → 「评论」文字 → 赞/收藏双锚点夹逼 → 单锚点推导）→
+     *    以「评论输入框出现」验证面板是否打开；未打开则视觉定位兜底
+     *    （截屏 → 多模态大模型识别聊天气泡图标坐标 → 手势点击）；
+     *    仍未打开则坐标硬点兜底；
+     * 2. 定位评论输入条（新版「说点什么…」伪装输入条先点按展开真正的输入弹窗），
+     *    多级写入（SET_TEXT / 点按激活 + SET_TEXT / 剪贴板 PASTE），每次写入后
+     *    读回输入框文本验证内容真正落框；
+     * 3. 发送前确保输入框仍持有文本并重新点按聚焦（键盘可能已被收起）→
+     *    跨窗口定位发送按钮 → 校验其已启用（禁用 = App 缓冲区为空）→ 点击；
+     * 4. 发送结果验证（文本仍在输入框则手势重试一次）后，关闭评论区面板。
      *
      * 任何环节失败均不阻塞主流程，记录日志后跳过。
      */
     private suspend fun performComment(): Boolean {
         val commentText = IntentKeywords.POSITIVE_COMMENTS.random()
 
-        // 0) 检测评论区是否已打开（输入框已可见）
+        // 前置硬拦截：直播间上下文绝不允许评论。
+        // 直播公屏聊天框也是屏幕底部的 EditText，若不拦截会被误判为「评论面板已打开」，
+        // 把预设评论写进直播间聊天框并发送出去（直播发送是高危风控+骚扰行为）。
+        run {
+            val root = rootInActiveWindow ?: return false
+            try {
+                if (isLiveRoomContext(root)) {
+                    Log.w(TAG, "检测到直播间上下文，跳过评论（防止误发到直播公屏）")
+                    addLog(OperationLog.sendCommentLog(false, "检测到直播间，跳过评论"))
+                    return false
+                }
+            } finally {
+                root.recycle()
+            }
+        }
+
+        // 0) 检测评论区是否已打开（真输入框或伪装输入条可见均算）
         val root0 = rootInActiveWindow
         var panelOpen = false
         if (root0 != null) {
             try {
-                panelOpen = findInputFieldInRoot(root0) != null
+                val bar = findCommentInputBar(root0)
+                panelOpen = bar != null
+                bar?.node?.recycle()
             } finally {
                 root0.recycle()
             }
         }
 
         if (!panelOpen) {
-            // 1) 按「右栏位置」定位评论按钮并点击
-            val root1 = rootInActiveWindow ?: return false
-            var commentBtn: AccessibilityNodeInfo? = null
-            var btnCx = 0
-            var btnCy = 0
-            try {
-                commentBtn = findCommentButtonByPosition(root1)
-                if (commentBtn == null) {
-                    // 无障碍拿不到评论按钮节点（纯图标无描述）→ 坐标硬点兜底
-                    val diag = describeRightRail(root1)
-                    Log.w(TAG, "评论按钮定位失败，右栏节点摘要: $diag")
-                    val dm = resources.displayMetrics
-                    btnCx = (dm.widthPixels * 0.875f).toInt()
-                    btnCy = (dm.heightPixels * 0.75f).toInt()
-                    Log.d(TAG, "使用坐标硬点点击评论按钮 ($btnCx, $btnCy)")
-                    dispatchTap(btnCx, btnCy)
-                } else {
-                    // 提前保存按钮中心坐标（节点回收后无法再获取）
-                    val r = Rect()
-                    commentBtn.getBoundsInScreen(r)
-                    btnCx = r.centerX()
-                    btnCy = r.centerY()
-
-                    val clicked = commentBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    if (!clicked) {
-                        // 无障碍点击无响应，回退到手势点击
-                        Log.d(TAG, "评论按钮无障碍点击无响应，回退手势点击 ($btnCx, $btnCy)")
-                        dispatchTap(btnCx, btnCy)
-                    }
-                }
-            } finally {
-                commentBtn?.recycle()
-                root1.recycle()
-            }
-            delay(1000)
+            // 1) 评论按钮定位 + 点击：节点语义锚点优先，未命中则坐标兜底
+            //    （右侧栏评论位，坐标按实测定下移一个按钮高度）。不依赖 VLM。
+            openCommentPanel()
         }
 
-        // 2) 定位评论输入框（最多 3s）
-        val inputNode = waitForInputField(timeoutMs = 3000)
-        if (inputNode == null) {
-            addLog(OperationLog.sendCommentLog(false, "未找到评论输入框"))
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            delay(500)
+        // 2) 定位评论输入条（新版「说点什么…」伪装输入条先点按展开真正的输入弹窗）
+        //    → 多级写入（SET_TEXT / 点按激活 / 剪贴板 PASTE）→ 读回验证真正落框
+        if (!typeCommentText(commentText, timeoutMs = 4000)) {
+            addLog(OperationLog.sendCommentLog(false, "评论内容未能写入输入框"))
+            closeCommentPanel()
             return false
         }
 
-        // 3) 聚焦 → 写入文字；失败则剪贴板粘贴兜底
-        inputNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        val bundle = Bundle()
-        bundle.putCharSequence(
-            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, commentText
-        )
-        var textOk = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, bundle)
-        if (!textOk) {
-            // SET_TEXT 失败：写入剪贴板后用 ACTION_PASTE 真正「粘贴」
-            runCatching {
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("comment", commentText))
-                inputNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                textOk = true
+        // 3) 发送：先确保输入框仍持有文本并重新点按聚焦（写入后键盘可能被收起，
+        //    草稿/焦点随之丢失），再跨窗口定位发送按钮、校验启用状态后点击
+        delay(600)
+        if (!ensureCommentTextBeforeSend(commentText)) {
+            addLog(OperationLog.sendCommentLog(false, "评论内容未能写入输入框"))
+            closeCommentPanel()
+            return false
+        }
+
+        var sendPoint = findSendTextButton()
+        // 发送前二次校验：确认仍在评论面板内（输入条可见且非直播聊天框）。
+        // 直播间的「发送」按钮文案与评论发送按钮相同，若此时界面已切到直播间，
+        // 会把写入的内容误发到直播公屏——校验不过则放弃发送。
+        if (!isCommentPanelOpen()) {
+            Log.w(TAG, "发送前校验失败：当前不在评论面板（疑似直播间），放弃发送")
+            addLog(OperationLog.sendCommentLog(false, "界面已离开评论面板，放弃发送"))
+            return false
+        }
+        // 未找到「发送」按钮 → 补一次 PASTE（确保 App 内部缓冲区有内容）后重试
+        if (sendPoint == null) {
+            Log.w(TAG, "未找到提交按钮，补救 PASTE 写入一次后重试")
+            if (!tryWriteComment(commentText, tapFirst = true, usePaste = true)) {
+                addLog(OperationLog.sendCommentLog(false, "评论内容未能写入输入框"))
+                closeCommentPanel()
+                return false
+            }
+            sendPoint = findSendTextButton()
+            if (sendPoint == null) {
+                addLog(OperationLog.sendCommentLog(false, "未找到提交按钮"))
+                closeCommentPanel()
+                return false
             }
         }
-        inputNode.recycle()
-        if (!textOk) {
-            addLog(OperationLog.sendCommentLog(false, "写入评论内容失败"))
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            delay(500)
-            return false
-        }
-
-        // 4) 延迟 1 秒后点击提交评论按钮
-        delay(1000)
-        val sendNode = waitForNode(
-            labels = IntentKeywords.COMMENT_SEND_TEXTS, timeoutMs = 3000
-        )
-        if (sendNode == null) {
-            addLog(OperationLog.sendCommentLog(false, "未找到提交按钮"))
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            delay(500)
-            return false
-        }
-        val sendClicked = sendNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        sendNode.recycle()
-        if (!sendClicked) {
+        // 发送按钮是不可点击的 TextView（可点击的是其父容器），直接手势点按中心
+        Log.d(TAG, "发送按钮手势点击 (${sendPoint.x}, ${sendPoint.y})")
+        if (!dispatchTap(sendPoint.x, sendPoint.y)) {
             addLog(OperationLog.sendCommentLog(false, "提交按钮点击无响应"))
-            performGlobalAction(GLOBAL_ACTION_BACK)
-            delay(500)
+            closeCommentPanel()
             return false
         }
 
-        // 5) 延迟 1 秒后关闭评论区（主循环随后切换下一视频）
+        // 4) 发送后等待 1 秒，让评论真正发出去
         delay(1000)
-        performGlobalAction(GLOBAL_ACTION_BACK)
+
+        // 5) 发送结果验证：若文本仍在输入框，说明发送未生效（如缓冲区未同步），手势重试一次
+        if (commentTextLanded(commentText)) {
+            Log.w(TAG, "发送后文本仍在输入框，手势重试发送一次")
+            val retryPoint = findSendTextButton()
+            if (retryPoint != null) {
+                dispatchTap(retryPoint.x, retryPoint.y)
+                delay(1000)
+            }
+        }
+
+        // 6) 收起键盘（按返回键）
+        Log.d(TAG, "发送完成，收起键盘")
+        performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        delay(1000)
+
+        // 7) 关闭评论区/输入弹窗（主循环随后切换下一视频）
+        closeCommentPanel()
 
         commentCount++
         addLog(OperationLog.sendCommentLog(true, "评论内容：$commentText"))
@@ -1235,17 +1570,43 @@ class DouyinAccessibilityService : AccessibilityService() {
         return true
     }
 
+    /** 评论伪装输入条匹配用的强提示词（不含裸「评论」，避免误命中「xxx条评论」标题） */
+    private val fakeInputBarHints = listOf("说点什么", "发表评论", "想说", "写评论", "输入评论", "留下你的精彩")
+
     /**
-     * 在当前节点树中查找评论输入框（EditText）。
-     *
-     * 评论区面板内可能存在多个输入框（如顶部的「搜索评论」框、底部的评论输入条），
-     * 直接取第一个会命中搜索框导致文字打错位置。选择策略：
-     * 1. 优先取 hint 命中 [IntentKeywords.COMMENT_INPUT_HINTS]（如「说点什么」）的输入框；
-     * 2. 否则取屏幕位置最靠底部的输入框（评论输入条固定在面板底部）。
-     *
-     * 调用方负责 recycle 返回的节点。
+     * 评论面板输入条（两种形态）：
+     * - 真正的 EditText：老版本评论面板内嵌输入框，或点按输入条后弹出的输入弹窗中的输入框；
+     * - 伪装输入条：新版本评论面板底部的「说点什么…」TextView，
+     *   必须先点按它弹出输入弹窗，才能对真正的 EditText 写入内容。
      */
-    private fun findInputFieldInRoot(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+    private class CommentInputBar(val node: AccessibilityNodeInfo, val isRealEditText: Boolean)
+
+    /**
+     * 在节点树中查找评论输入条。
+     *
+     * 查找顺序：
+     * 1. 真 EditText：hint/text/描述命中 [IntentKeywords.COMMENT_INPUT_HINTS]；
+     * 2. 真 EditText 兜底：屏幕 25% 高度以下、非「搜索」非直播聊天的最底部 EditText
+     *    （评论输入条固定在底部；阈值取 25% 而非 50%，兼容输入弹窗+软键盘弹出后
+     *    输入框被顶到屏幕中部的场景——只排除顶部的搜索框区域即可）；
+     * 3. 伪装输入条（[requireRealEditText] 为 false 时）：屏幕 25% 高度以下、文本命中
+     *    [fakeInputBarHints] 的非 EditText 可见节点，取最底部一个。
+     *
+     * 所有候选一律排除直播公屏聊天框（hint/描述含 [IntentKeywords.LIVE_INPUT_HINTS]，
+     * 如「和主播聊聊」），否则直播聊天框会被误判为评论输入框，
+     * 导致预设评论被写进直播间并发送。
+     *
+     * 调用方负责 recycle 返回的 [CommentInputBar.node]。
+     */
+    private fun findCommentInputBar(
+        root: AccessibilityNodeInfo,
+        requireRealEditText: Boolean = false
+    ): CommentInputBar? {
+        val dm = resources.displayMetrics
+        // 仅排除顶部区域（视频页搜索框所在），不排除中部：
+        // 键盘弹出后输入弹窗的输入框会被顶到屏幕中部，仍需可命中
+        val topExcluded = (dm.heightPixels * 0.25f).toInt()
+
         val all = ArrayList<AccessibilityNodeInfo>()
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
@@ -1260,56 +1621,98 @@ class DouyinAccessibilityService : AccessibilityService() {
             }
         }
 
-        var result: AccessibilityNodeInfo? = null
-        // 1) hint 命中评论输入提示词
-        for (n in all) {
-            val cn = n.className?.toString() ?: ""
-            if (!cn.contains("EditText") || !n.isVisibleToUser) continue
-            val hintText = buildString {
+        fun combinedTextOf(n: AccessibilityNodeInfo): String = buildString {
+            append(n.hintText?.toString() ?: "")
+            append(" ")
+            append(n.text?.toString() ?: "")
+            append(" ")
+            append(n.contentDescription?.toString() ?: "")
+        }.lowercase()
+
+        /** 是否直播聊天框/搜索框等非评论输入节点（一律排除） */
+        fun isExcludedInput(n: AccessibilityNodeInfo): Boolean {
+            // hint/描述含直播公屏聊天特征（主播/公屏/弹幕/聊聊…）→ 直播聊天框，排除
+            // （只看 hint 与描述，不看 text：text 可能是评论内容误伤）
+            val hintDesc = buildString {
                 append(n.hintText?.toString() ?: "")
-                append(" ")
-                append(n.text?.toString() ?: "")
                 append(" ")
                 append(n.contentDescription?.toString() ?: "")
             }.lowercase()
-            if (IntentKeywords.COMMENT_INPUT_HINTS.any { it.lowercase() in hintText }) {
-                result = n
+            if (IntentKeywords.LIVE_INPUT_HINTS.any { it.lowercase() in hintDesc }) return true
+            // 搜索框排除（看全量文本：搜索框的 text 也只会是搜索相关）
+            if ("搜索" in combinedTextOf(n)) return true
+            return false
+        }
+
+        var result: CommentInputBar? = null
+
+        // 1) 真 EditText：hint 命中评论输入提示词
+        for (n in all) {
+            val cn = n.className?.toString() ?: ""
+            if (!cn.contains("EditText") || !n.isVisibleToUser) continue
+            if (isExcludedInput(n)) continue
+            if (IntentKeywords.COMMENT_INPUT_HINTS.any { it.lowercase() in combinedTextOf(n) }) {
+                result = CommentInputBar(n, true)
                 break
             }
         }
-        // 2) 兜底：取屏幕最底部的可见 EditText（评论输入条在面板底部）
+        // 2) 真 EditText 兜底：25% 屏高以下最底部的非排除输入框
         if (result == null) {
             var bestCy = -1
+            var best: AccessibilityNodeInfo? = null
             for (n in all) {
                 val cn = n.className?.toString() ?: ""
                 if (!cn.contains("EditText") || !n.isVisibleToUser) continue
+                if (isExcludedInput(n)) continue
                 val r = Rect()
                 n.getBoundsInScreen(r)
+                if (r.centerY() < topExcluded) continue
                 if (r.centerY() > bestCy) {
                     bestCy = r.centerY()
-                    result = n
+                    best = n
                 }
             }
+            if (best != null) result = CommentInputBar(best, true)
+        }
+        // 3) 伪装输入条：非 EditText 的「说点什么…」文本条（点按后才出现真正输入框）
+        if (result == null && !requireRealEditText) {
+            var bestCy = -1
+            var best: AccessibilityNodeInfo? = null
+            for (n in all) {
+                val cn = n.className?.toString() ?: ""
+                if (cn.contains("EditText") || !n.isVisibleToUser) continue
+                if (isExcludedInput(n)) continue
+                if (fakeInputBarHints.none { it in combinedTextOf(n) }) continue
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (r.centerY() < topExcluded) continue
+                if (r.centerY() > bestCy) {
+                    bestCy = r.centerY()
+                    best = n
+                }
+            }
+            if (best != null) result = CommentInputBar(best, false)
         }
 
+        val keep = result?.node
         for (n in all) {
-            if (n != root && n != result) n.recycle()
+            if (n != root && n != keep) n.recycle()
         }
         return result
     }
 
-    /**
-     * 轮询当前节点树，等待出现用户可见的 EditText 输入框。
-     * 用于评论区打开后定位输入框。
-     */
-    private suspend fun waitForInputField(timeoutMs: Long): AccessibilityNodeInfo? {
+    /** 轮询等待评论输入条出现（真 EditText 或伪装输入条）。 */
+    private suspend fun waitForCommentInputBar(
+        timeoutMs: Long,
+        requireRealEditText: Boolean = false
+    ): CommentInputBar? {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             val root = rootInActiveWindow
             if (root != null) {
                 try {
-                    val input = findInputFieldInRoot(root)
-                    if (input != null) return input
+                    val bar = findCommentInputBar(root, requireRealEditText)
+                    if (bar != null) return bar
                 } finally {
                     root.recycle()
                 }
@@ -1317,6 +1720,353 @@ class DouyinAccessibilityService : AccessibilityService() {
             delay(200)
         }
         return null
+    }
+
+    /**
+     * 读回输入框文本，验证评论内容是否已真正写入（防 SET_TEXT / PASTE 假成功）。
+     * 界面上任一非排除（非搜索/非直播聊天）的可见 EditText 文本包含目标文本即算落框
+     * ——不限定具体是哪一个输入框、也不限定屏幕位置（键盘弹出后输入框可能被顶到中部）。
+     */
+    private fun commentTextLanded(text: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val all = ArrayList<AccessibilityNodeInfo>()
+        return try {
+            val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+            all.add(root)
+            while (queue.isNotEmpty()) {
+                val node = queue.removeFirst()
+                repeat(node.childCount) { i ->
+                    node.getChild(i)?.let { child ->
+                        all.add(child)
+                        queue.add(child)
+                    }
+                }
+            }
+            var landed = false
+            for (n in all) {
+                if (landed) break
+                val cn = n.className?.toString() ?: ""
+                if (!cn.contains("EditText") || !n.isVisibleToUser) continue
+                // 排除搜索框/直播聊天框，防止误把无关输入框的文本当成评论内容
+                val hintDesc = buildString {
+                    append(n.hintText?.toString() ?: "")
+                    append(" ")
+                    append(n.contentDescription?.toString() ?: "")
+                }.lowercase()
+                if (IntentKeywords.LIVE_INPUT_HINTS.any { it.lowercase() in hintDesc }) continue
+                if ("搜索" in hintDesc) continue
+                if ((n.text?.toString() ?: "").contains(text)) landed = true
+            }
+            landed
+        } finally {
+            for (n in all) if (n != root) n.recycle()
+            root.recycle()
+        }
+    }
+
+    /**
+     * 单次写入尝试：取当前真输入框 →（可选）真实点按激活 → FOCUS →
+     * SET_TEXT 或「先清空再剪贴板 PASTE」→ 读回验证。
+     *
+     * @param tapFirst 是否先真实点按输入框：部分自定义输入框需被真实触摸激活后
+     *                 才接受无障碍写入；且点按弹键盘后输入框位置可能变化，点按后重新取节点
+     * @param usePaste true 时走剪贴板 + ACTION_PASTE（先清空输入框防内容叠加）；
+     *                 false 时走 ACTION_SET_TEXT
+     */
+    private suspend fun tryWriteComment(text: String, tapFirst: Boolean, usePaste: Boolean): Boolean {
+        var input = waitForCommentInputBar(1500, requireRealEditText = true) ?: return false
+        if (tapFirst) {
+            val r = Rect()
+            input.node.getBoundsInScreen(r)
+            input.node.recycle()
+            dispatchTap(r.centerX(), r.centerY())
+            delay(400)
+            input = waitForCommentInputBar(1500, requireRealEditText = true) ?: return false
+        }
+
+        input.node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val ok: Boolean
+        if (usePaste) {
+            // 剪贴板 + 先清空再粘贴：若上一次 SET_TEXT 实际已落框但读不到，
+            // 直接 PASTE 会叠加出重复内容，故先清空
+            runCatching {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("comment", text))
+            }
+            val clear = Bundle()
+            clear.putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, ""
+            )
+            runCatching { input.node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clear) }
+            delay(150)
+            ok = runCatching { input.node.performAction(AccessibilityNodeInfo.ACTION_PASTE) }
+                .getOrDefault(false)
+        } else {
+            val bundle = Bundle()
+            bundle.putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text
+            )
+            ok = runCatching { input.node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, bundle) }
+                .getOrDefault(false)
+        }
+        input.node.recycle()
+        if (!ok) return false
+        delay(200) // 等文本同步到节点后再读回验证
+        if (!commentTextLanded(text)) return false
+        // 双重验证：App 内部编辑缓冲区是否真正有内容。
+        // 部分自定义输入框上 SET_TEXT 只更新无障碍节点文本（视觉可见、读回通过），
+        // 但不触发 App 的文本监听 → App 发送时读到空缓冲 → 先收起键盘再提示「无内容」。
+        // 抖音发送按钮在缓冲区为空时禁用（置灰），以此识别「假成功」并继续降级尝试。
+        if (!isSendButtonReady(text)) {
+            Log.w(TAG, "文本已显示但发送按钮仍禁用（App 缓冲区为空），判为假成功")
+            return false
+        }
+        return true
+    }
+
+    /**
+     * 定位评论输入条并把预设评论 [text] 写入输入框。
+     *
+     * 流程：
+     * 1. 等待评论输入条出现（真 EditText 或伪装输入条）；
+     * 2. 若是伪装输入条（新版「说点什么…」TextView）：点按展开真正的输入弹窗；
+     * 3. 多级写入尝试（每级「节点读回 + 发送按钮就绪」双重验证，假成功即降级）：
+     *    a. 点按激活 + 清空 + 剪贴板 PASTE——走真实编辑管线（触发 App 的文本监听，
+     *       内部缓冲区同步更新），对抖音自定义输入框最可靠，优先尝试；
+     *    b. FOCUS + SET_TEXT——标准 EditText 直接生效，最快；
+     *    c. 点按激活 + SET_TEXT——部分输入框需真实触摸激活后才接受无障碍写入。
+     */
+    private suspend fun typeCommentText(text: String, timeoutMs: Long): Boolean {
+        val bar = waitForCommentInputBar(timeoutMs)
+        if (bar == null) {
+            Log.w(TAG, "未找到评论输入条（既无 EditText 也无「说点什么」输入条）")
+            return false
+        }
+
+        if (bar.isRealEditText) {
+            bar.node.recycle()
+        } else {
+            // 伪装输入条：点按展开真正的输入弹窗
+            val r = Rect()
+            bar.node.getBoundsInScreen(r)
+            Log.d(TAG, "输入条为伪装节点，点按展开输入弹窗 (${r.centerX()}, ${r.centerY()})")
+            if (!bar.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                dispatchTap(r.centerX(), r.centerY())
+            }
+            bar.node.recycle()
+            delay(800)
+        }
+
+        if (tryWriteComment(text, tapFirst = true, usePaste = true)) {
+            Log.d(TAG, "评论内容已写入输入框（点按激活 + 剪贴板 PASTE）：$text")
+            return true
+        }
+        Log.w(TAG, "评论写入尝试失败：点按激活 + 剪贴板 PASTE")
+        if (tryWriteComment(text, tapFirst = false, usePaste = false)) {
+            Log.d(TAG, "评论内容已写入输入框（SET_TEXT）：$text")
+            return true
+        }
+        Log.w(TAG, "评论写入尝试失败：FOCUS + SET_TEXT")
+        if (tryWriteComment(text, tapFirst = true, usePaste = false)) {
+            Log.d(TAG, "评论内容已写入输入框（点按激活 + SET_TEXT）：$text")
+            return true
+        }
+        Log.w(TAG, "评论写入尝试失败：点按激活 + SET_TEXT")
+        return false
+    }
+
+    /**
+     * 发送前确保输入框仍持有评论文本并重新聚焦：
+     * - 输入框消失（键盘收起连带输入弹窗收起）→ 重走完整写入流程（重新点开弹窗）；
+     * - 文本丢失（弹窗重置清空草稿）→ 重写一次；
+     * - 文本仍在 → 点按输入框重新聚焦并唤回键盘，验证键盘弹起（输入框仍可见），
+     *   没弹起则重试一次，仍失败则重走写入流程。
+     */
+    private suspend fun ensureCommentTextBeforeSend(text: String): Boolean {
+        val bar = waitForCommentInputBar(1000, requireRealEditText = true)
+        if (bar == null) {
+            Log.w(TAG, "发送前输入框消失（输入弹窗可能已收起），重新打开并写入")
+            return typeCommentText(text, timeoutMs = 4000)
+        }
+        val hasText = (bar.node.text?.toString() ?: "").contains(text)
+        val r = Rect()
+        bar.node.getBoundsInScreen(r)
+        bar.node.recycle()
+        if (!hasText) {
+            Log.w(TAG, "发送前输入框文本丢失，重新写入")
+            return typeCommentText(text, timeoutMs = 4000)
+        }
+        // 文本仍在：点按输入框重新聚焦并唤回键盘
+        dispatchTap(r.centerX(), r.centerY())
+        delay(500)
+        // 验证键盘弹起：输入框应仍可见
+        val bar2 = waitForCommentInputBar(1500, requireRealEditText = true)
+        if (bar2 == null) {
+            Log.w(TAG, "点按输入框后键盘未弹起（输入框消失），重走写入流程")
+            return typeCommentText(text, timeoutMs = 4000)
+        }
+        val textStill = (bar2.node.text?.toString() ?: "").contains(text)
+        bar2.node.recycle()
+        if (!textStill) {
+            Log.w(TAG, "点按输入框后文本丢失，重走写入流程")
+            return typeCommentText(text, timeoutMs = 4000)
+        }
+        return true
+    }
+
+    /**
+     * 评论「发送」按钮是否就绪（跨窗口查找，存在且启用）。
+     *
+     * 抖音输入弹窗的发送按钮在编辑缓冲区为空时禁用（置灰），文本真正进入
+     * App 内部缓冲区后才启用。以此区分「无障碍节点文本已更新（视觉可见）」
+     * 与「App 缓冲区真正有内容」——后者才是能成功发送的状态。
+     * 未找到发送按钮时无法判断，返回 true（不阻塞流程）。
+     */
+    private fun isSendButtonReady(preferredText: String): Boolean {
+        val btn = findSendButtonInWindows(preferredText) ?: return true
+        val ready = btn.isEnabled
+        btn.recycle()
+        return ready
+    }
+
+    /**
+     * 跨窗口查找评论「发送」按钮。
+     *
+     * 输入弹窗在部分抖音版本是独立窗口（评论面板窗口之外），键盘弹出/收起时
+     * rootInActiveWindow 可能在面板与弹窗窗口之间切换，只搜活跃窗口会漏找或找错。
+     * 这里遍历服务可见的所有窗口：
+     * 1. 锁定「输入框所在窗口」——优先取 EditText 文本包含 [preferredText] 的窗口
+     *    （即刚写入内容的输入弹窗），否则取含屏幕下半部可见 EditText 的窗口；
+     * 2. 仅在该窗口内匹配 [IntentKeywords.COMMENT_SEND_TEXTS] 的可点击节点，
+     *    取「启用优先、位置最靠底部」的一个（发送按钮固定在输入弹窗底部）。
+     *    限定输入框所在窗口，避免误点评论区里恰好含「发送」字样的评论项。
+     *
+     * @param preferredText 已写入的评论文本（用于锁定输入弹窗窗口）；null 时不校验
+     * @return 发送按钮节点（调用方负责 recycle）；未找到返回 null
+     */
+    private fun findSendButtonInWindows(preferredText: String? = null): AccessibilityNodeInfo? {
+        val dm = resources.displayMetrics
+        val bottomArea = (dm.heightPixels * 0.5f).toInt()
+
+        // 每个窗口的扫描结果：root + 是否含目标输入框 + 发送按钮候选
+        val windowRoots = ArrayList<AccessibilityNodeInfo>()
+        val hasPreferredInput = ArrayList<Boolean>()
+        val hasBottomInput = ArrayList<Boolean>()
+        val sendCandidates = ArrayList<MutableList<AccessibilityNodeInfo>>()
+
+        for (window in windows) {
+            val root = window.root
+            runCatching { window.recycle() }
+            if (root == null) continue
+            windowRoots.add(root)
+            hasPreferredInput.add(false)
+            hasBottomInput.add(false)
+            sendCandidates.add(ArrayList())
+            val idx = windowRoots.size - 1
+
+            val all = ArrayList<AccessibilityNodeInfo>()
+            val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+            all.add(root)
+            while (queue.isNotEmpty()) {
+                val node = queue.removeFirst()
+                repeat(node.childCount) { i ->
+                    node.getChild(i)?.let { child ->
+                        all.add(child)
+                        queue.add(child)
+                    }
+                }
+
+                val cn = node.className?.toString() ?: ""
+                if ((node.isEditable || cn.contains("EditText")) && node.isVisibleToUser) {
+                    if (preferredText != null &&
+                        (node.text?.toString() ?: "").contains(preferredText)
+                    ) {
+                        hasPreferredInput[idx] = true
+                    }
+                    val r = Rect()
+                    node.getBoundsInScreen(r)
+                    if (r.centerY() >= bottomArea) hasBottomInput[idx] = true
+                }
+
+                val label = buildString {
+                    append(node.text?.toString() ?: "")
+                    append(" ")
+                    append(node.contentDescription?.toString() ?: "")
+                }.lowercase()
+                if (node.isClickable &&
+                    IntentKeywords.COMMENT_SEND_TEXTS.any { it.lowercase() in label }
+                ) {
+                    val r = Rect()
+                    node.getBoundsInScreen(r)
+                    // 发送按钮固定在输入弹窗底部；屏幕上半部命中的多为
+                    // 评论区内容/其他面板里的文本，一律不选
+                    if (r.centerY() >= bottomArea) sendCandidates[idx].add(node)
+                }
+            }
+
+            // 回收非候选节点（候选保留待跨窗口最终抉择）
+            val keep = HashSet<AccessibilityNodeInfo>(sendCandidates[idx])
+            for (n in all) if (n !in keep) n.recycle()
+        }
+
+        // 锁定输入框所在窗口：优先含目标文本输入框的窗口，其次含底部输入框的窗口
+        var targetIdx = -1
+        for (i in hasPreferredInput.indices) {
+            if (hasPreferredInput[i]) {
+                targetIdx = i
+                break
+            }
+        }
+        if (targetIdx < 0) {
+            for (i in hasBottomInput.indices) {
+                if (hasBottomInput[i]) {
+                    targetIdx = i
+                    break
+                }
+            }
+        }
+        if (targetIdx < 0) {
+            // 没有任何含输入框的窗口：全部候选作废
+            sendCandidates.forEach { list -> list.forEach { it.recycle() } }
+            return null
+        }
+
+        var best: AccessibilityNodeInfo? = null
+        var bestScore = -1L
+        for (i in sendCandidates.indices) {
+            for (cand in sendCandidates[i]) {
+                if (i != targetIdx) {
+                    cand.recycle()
+                    continue
+                }
+                val r = Rect()
+                cand.getBoundsInScreen(r)
+                var score = r.centerY().toLong()
+                if (cand.isEnabled) score += 1_000_000L // 启用的按钮优先于置灰的
+                if (score > bestScore) {
+                    bestScore = score
+                    best?.recycle()
+                    best = cand
+                } else {
+                    cand.recycle()
+                }
+            }
+        }
+        return best
+    }
+
+    /**
+     * 关闭评论面板（含可能叠加的输入弹窗）。
+     * 每按一次返回前先确认面板仍打开：第一次返回关输入弹窗，第二次关评论面板；
+     * 面板未打开时不按返回，避免误退出抖音。面板若残留打开，主循环的上滑切视频
+     * 手势会变成滚动评论区，必须确保关干净。
+     */
+    private suspend fun closeCommentPanel() {
+        repeat(2) {
+            if (!isCommentPanelOpen()) return
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(400)
+        }
     }
 
     /**

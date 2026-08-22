@@ -77,6 +77,97 @@ class LlmClient(
         return@withContext parseResponse(responseText)
     }
 
+    /**
+     * 视觉定位：把一张屏幕截图发给多模态大模型，定位抖音视频页的「评论按钮」。
+     *
+     * 用于无障碍节点树定位不到评论按钮（纯聊天气泡图标、无文字/描述、
+     * resource-id 随版本漂移）时的精准兜底——模型直接「看」屏幕像素，
+     * 不受抖音界面改版与节点结构变化影响。
+     *
+     * @param frame 当前屏幕截图（JPEG 字节）
+     * @return 评论按钮中心相对图片宽/高的归一化坐标 (x, y)，取值 0~1；
+     *         模型未找到按钮、JSON 解析失败或接口异常时返回 null（由调用方走兜底）。
+     */
+    suspend fun locateCommentButton(frame: ByteArray): Pair<Float, Float>? =
+        withContext(Dispatchers.IO) {
+            val endpoint = baseUrl.trimEnd('/') + "/chat/completions"
+
+            val messages = JSONArray()
+            messages.put(JSONObject().apply {
+                put("role", "system")
+                put("content", buildLocateSystemPrompt())
+            })
+
+            val userContent = JSONArray()
+            userContent.put(JSONObject().apply {
+                put("type", "text")
+                put("text", "请定位这张截图中抖音评论按钮的坐标，严格只返回 JSON。")
+            })
+            val b64 = Base64.encodeToString(frame, Base64.NO_WRAP)
+            userContent.put(JSONObject().apply {
+                put("type", "image_url")
+                put("image_url", JSONObject().apply {
+                    put("url", "data:image/jpeg;base64,$b64")
+                })
+            })
+            messages.put(JSONObject().apply {
+                put("role", "user")
+                put("content", userContent)
+            })
+
+            val body = JSONObject().apply {
+                put("model", modelName)
+                put("messages", messages)
+                // 定位任务要确定性结果，温度调低
+                put("temperature", 0.1)
+                put("max_tokens", 200)
+            }
+
+            return@withContext runCatching {
+                val responseText = postJson(endpoint, body)
+                parseLocateResponse(responseText)
+            }.getOrNull()
+        }
+
+    /** 解析视觉定位响应，抽出评论按钮的归一化坐标 (x, y) */
+    private fun parseLocateResponse(json: String): Pair<Float, Float>? {
+        val root = JSONObject(json)
+        val choices = root.optJSONArray("choices") ?: JSONArray()
+        if (choices.length() == 0) return null
+        val content = choices.getJSONObject(0)
+            .optJSONObject("message")?.optString("content", "") ?: ""
+        // 去掉可能的 ```json ... ``` 包裹
+        val cleaned = content
+            .replace("```json", "", ignoreCase = true)
+            .replace("```", "", ignoreCase = true)
+            .trim()
+        val start = cleaned.indexOf('{')
+        val end = cleaned.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        val obj = runCatching { JSONObject(cleaned.substring(start, end + 1)) }.getOrNull()
+            ?: return null
+        if (!obj.optBoolean("found", false)) return null
+        val x = obj.optDouble("x", -1.0).toFloat()
+        val y = obj.optDouble("y", -1.0).toFloat()
+        if (x !in 0f..1f || y !in 0f..1f) return null
+        return x to y
+    }
+
+    /** 视觉定位评论按钮的系统提示词 */
+    private fun buildLocateSystemPrompt(): String = """
+        你是手机屏幕元素定位助手。用户给你一张抖音视频播放页的截图，请在截图中找到「评论按钮」。
+        评论按钮的特征：
+        - 一个聊天气泡形状的图标（白色空心气泡）
+        - 位于屏幕右侧边缘的竖排操作栏中
+        - 在点赞（心形）图标下方、收藏（五角星）或分享（箭头）图标上方
+        - 图标下方通常显示评论数量（如 1234 或 1.2万）
+        注意区分：不要选点赞、收藏、分享、转发、作者头像、音乐唱片图标。
+        请严格只返回一个 JSON 对象，不要包含任何额外说明文字，格式如下：
+        {"found": true, "x": 0.875, "y": 0.62}
+        其中 x、y 是评论按钮图标中心的坐标，取值范围 0~1，分别相对于图片的宽度和高度。
+        若截图中不存在该按钮（例如已在评论区面板内），返回 {"found": false, "x": 0, "y": 0}。
+    """.trimIndent()
+
     private fun postJson(endpoint: String, body: JSONObject): String {
         val conn = URL(endpoint).openConnection() as HttpURLConnection
         conn.requestMethod = "POST"

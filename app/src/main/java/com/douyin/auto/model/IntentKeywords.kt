@@ -130,6 +130,18 @@ object IntentKeywords {
      *  用于替代裸 "直播" 子串匹配，避免「直播广场」等文字误命中。 */
     val LIVE_CTA_TEXTS: List<String> = listOf("点击进入直播间")
 
+    /** 直播间公屏聊天输入框特征（hint/描述命中即视为直播聊天框，非评论输入框）。
+     *  用于防止把直播聊天框误判为评论输入框，导致评论内容被写进直播间并发送。 */
+    val LIVE_INPUT_HINTS: List<String> = listOf(
+        "主播", "公屏", "弹幕", "聊聊", "聊天"
+    )
+
+    /** 直播间界面强特征文本（评论面板内不会出现的直播间专属 UI 文案）。
+     *  命中任一即判定当前处于直播间上下文。 */
+    val LIVE_ROOM_TEXTS: List<String> = listOf(
+        "粉丝团", "灯牌", "公屏"
+    )
+
     /** 评论页面特征文本（用于判断当前是否在评论区） */
     val COMMENT_PAGE_TEXTS: List<String> = listOf(
         "评论", "共", "条评论", "回复"
