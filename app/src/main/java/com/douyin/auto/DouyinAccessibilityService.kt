@@ -1018,17 +1018,47 @@ class DouyinAccessibilityService : AccessibilityService() {
         Log.d(TAG, "===== 节点树 dump 结束 =====")
     }
 
-    /** 当前评论面板是否已打开（真输入框或「说点什么」伪装输入条可见即算）。 */
+    /**
+     * 当前评论面板是否已打开（真输入框或「说点什么」伪装输入条可见即算）。
+     * 跨窗口查找：输入弹窗可能是独立窗口，键盘弹出后活跃窗口可能切到输入法窗口。
+     */
     private fun isCommentPanelOpen(): Boolean {
-        val root = rootInActiveWindow ?: return false
-        return try {
-            val bar = findCommentInputBar(root)
-            val open = bar != null
-            bar?.node?.recycle()
-            open
-        } finally {
-            root.recycle()
+        val root = rootInActiveWindow
+        if (root != null) {
+            try {
+                val bar = findCommentInputBar(root)
+                if (bar != null) {
+                    bar.node.recycle()
+                    return true
+                }
+            } finally {
+                root.recycle()
+            }
         }
+        for (window in windows) {
+            val wRoot = window.root
+            if (wRoot == null) {
+                runCatching { window.recycle() }
+                continue
+            }
+            val pkg = wRoot.packageName?.toString() ?: ""
+            val isDouyin = pkg == DOUYIN_PACKAGE || window.title?.toString()?.contains("抖音") == true
+            if (!isDouyin) {
+                runCatching { window.recycle() }
+                continue
+            }
+            var found = false
+            try {
+                val bar = findCommentInputBar(wRoot)
+                found = bar != null
+                bar?.node?.recycle()
+            } finally {
+                runCatching { wRoot.recycle() }
+                runCatching { window.recycle() }
+            }
+            if (found) return true
+        }
+        return false
     }
 
     /**
@@ -1572,7 +1602,11 @@ class DouyinAccessibilityService : AccessibilityService() {
     }
 
     /** 评论伪装输入条匹配用的强提示词（不含裸「评论」，避免误命中「xxx条评论」标题） */
-    private val fakeInputBarHints = listOf("说点什么", "发表评论", "想说", "写评论", "输入评论", "留下你的精彩")
+    private val fakeInputBarHints = listOf(
+        "说点什么", "发表评论", "想说", "写评论", "输入评论", "留下你的精彩",
+        // 新版抖音占位文案：「善语结善缘，恶语伤人心」「发条有爱的评论吧」等
+        "善语", "评论一下", "留下你的评论", "友善的评论", "有爱的评论"
+    )
 
     /**
      * 评论面板输入条（两种形态）：
@@ -1702,7 +1736,11 @@ class DouyinAccessibilityService : AccessibilityService() {
         return result
     }
 
-    /** 轮询等待评论输入条出现（真 EditText 或伪装输入条）。 */
+    /**
+     * 轮询等待评论输入条出现（真 EditText 或伪装输入条）。
+     * 先查活跃窗口，再跨窗口查所有抖音窗口——输入弹窗可能是独立窗口，
+     * 键盘弹出后活跃窗口还可能切到输入法窗口，只查活跃窗口会漏检。
+     */
     private suspend fun waitForCommentInputBar(
         timeoutMs: Long,
         requireRealEditText: Boolean = false
@@ -1717,6 +1755,27 @@ class DouyinAccessibilityService : AccessibilityService() {
                 } finally {
                     root.recycle()
                 }
+            }
+            for (window in windows) {
+                val wRoot = window.root
+                if (wRoot == null) {
+                    runCatching { window.recycle() }
+                    continue
+                }
+                val pkg = wRoot.packageName?.toString() ?: ""
+                val isDouyin = pkg == DOUYIN_PACKAGE || window.title?.toString()?.contains("抖音") == true
+                if (!isDouyin) {
+                    runCatching { window.recycle() }
+                    continue
+                }
+                var found: CommentInputBar? = null
+                try {
+                    found = findCommentInputBar(wRoot, requireRealEditText)
+                } finally {
+                    runCatching { wRoot.recycle() }
+                    runCatching { window.recycle() }
+                }
+                if (found != null) return found
             }
             delay(200)
         }
@@ -1830,7 +1889,8 @@ class DouyinAccessibilityService : AccessibilityService() {
      *
      * 流程：
      * 1. 等待评论输入条出现（真 EditText 或伪装输入条）；
-     * 2. 若是伪装输入条（新版「说点什么…」TextView）：点按展开真正的输入弹窗；
+     * 2. 若是伪装输入条（新版「说点什么…」TextView）：手势点按展开真正的输入弹窗；
+     *    输入条未识别时用面板底部固定坐标兜底点按，出现真 EditText 即算展开成功；
      * 3. 多级写入尝试（每级「节点读回 + 发送按钮就绪」双重验证，假成功即降级）：
      *    a. 点按激活 + 清空 + 剪贴板 PASTE——走真实编辑管线（触发 App 的文本监听，
      *       内部缓冲区同步更新），对抖音自定义输入框最可靠，优先尝试；
@@ -1839,45 +1899,41 @@ class DouyinAccessibilityService : AccessibilityService() {
      */
     private suspend fun typeCommentText(text: String, timeoutMs: Long): Boolean {
         val bar = waitForCommentInputBar(timeoutMs)
-        if (bar == null) {
-            Log.w(TAG, "未找到评论输入条（既无 EditText 也无「说点什么」输入条）")
-            return false
-        }
-
-        if (bar.isRealEditText) {
+        if (bar != null && bar.isRealEditText) {
             bar.node.recycle()
         } else {
-            // 伪装输入条：手势点按展开真正的输入弹窗并唤出键盘。
-            // 不能用 performAction(ACTION_CLICK)——抖音自定义输入条常「假成功」（返回 true 但不展开），
-            // 导致输入弹窗/键盘没唤起，后续写入失败。手势点按坐标更可靠。
+            bar?.node?.recycle()
+            // 伪装输入条（或输入条未能识别）：手势点按展开真正的输入弹窗并唤出键盘。
+            // - 不用 performAction(ACTION_CLICK)：抖音自定义输入条常「假成功」（返回 true 但不展开）；
+            // - 每轮重新定位输入条取新坐标（面板展开动画期间旧 rect 会漂移）；
+            // - 输入条节点找不到（占位文案改版不匹配）或前两轮点按无效时，
+            //   用评论面板底部输入条的固定坐标兜底点按；
+            // - 展开成功 = 出现真正的 EditText（跨窗口查找：输入弹窗可能是独立窗口，
+            //   键盘弹出后活跃窗口还可能切到输入法窗口）。
+            val dm = resources.displayMetrics
+            val fallbackPoint = Point(
+                (dm.widthPixels * 0.38f).toInt(),
+                (dm.heightPixels * 0.925f).toInt()
+            )
             var expanded = false
-            repeat(3) { attempt ->
-                val root = rootInActiveWindow
-                val r = Rect()
-                if (root != null) {
-                    try {
-                        val fb = findCommentInputBar(root, requireRealEditText = false)
-                        if (fb != null) {
-                            fb.node.getBoundsInScreen(r)
-                            fb.node.recycle()
-                        }
-                    } finally {
-                        root.recycle()
-                    }
+            loop@ for (attempt in 1..3) {
+                val tapPoint = if (attempt < 3) {
+                    locateFakeBarTapPoint() ?: fallbackPoint
+                } else {
+                    fallbackPoint
                 }
-                if (r.isEmpty) return@repeat
-                Log.d(TAG, "输入条为伪装节点，手势点按展开输入弹窗，第${attempt + 1}次 (${r.centerX()}, ${r.centerY()})")
-                dispatchTap(r.centerX(), r.centerY())
-                delay(900)
-                // 弹窗唤起成功 = 出现真正的输入框（EditText）
-                if (waitForCommentInputBar(1200, requireRealEditText = true) != null) {
+                Log.d(TAG, "点按输入条展开输入弹窗，第${attempt}次 (${tapPoint.x}, ${tapPoint.y})")
+                if (!dispatchTap(tapPoint.x, tapPoint.y)) {
+                    Log.w(TAG, "手势下发失败（dispatchGesture 返回 false），稍后重试")
+                }
+                delay(1000)
+                if (waitForCommentInputBar(1500, requireRealEditText = true) != null) {
                     expanded = true
-//                    exitProcess(0)
-                    break
+                    break@loop
                 }
             }
             if (!expanded) {
-                Log.w(TAG, "点按伪装输入条多次仍未唤起输入弹窗（键盘未弹出），写入流程降级继续")
+                Log.w(TAG, "点按输入条 3 次仍未唤起输入弹窗（键盘未弹出），写入流程降级继续")
             }
         }
 
@@ -1897,6 +1953,42 @@ class DouyinAccessibilityService : AccessibilityService() {
         }
         Log.w(TAG, "评论写入尝试失败：点按激活 + SET_TEXT")
         return false
+    }
+
+    /**
+     * 定位伪装输入条（「说点什么…」文本条）的手势点按坐标。
+     *
+     * 点按位置策略：输入条通常是 [图标][占位文本……][表情/@][发送] 的横向布局，
+     * 若命中节点是宽容器，取中心会点到右侧的表情/@图标（点开的是表情面板而非
+     * 输入弹窗）。因此宽度超过半屏的节点点按其左侧 30% 处（占位文本区域），
+     * 窄节点（占位 TextView 本身）点中心。
+     *
+     * @return 点按坐标；未找到输入条返回 null（调用方走固定坐标兜底）
+     */
+    private fun locateFakeBarTapPoint(): Point? {
+        val root = rootInActiveWindow ?: return null
+        try {
+            val bar = findCommentInputBar(root, requireRealEditText = false) ?: return null
+            val r = Rect()
+            bar.node.getBoundsInScreen(r)
+            val label = buildString {
+                append(bar.node.text?.toString() ?: "")
+                append("/")
+                append(bar.node.contentDescription?.toString() ?: "")
+            }
+            bar.node.recycle()
+            if (r.isEmpty) return null
+            val dm = resources.displayMetrics
+            val x = if (r.width() > dm.widthPixels * 0.5f) {
+                r.left + (r.width() * 0.3f).toInt()
+            } else {
+                r.centerX()
+            }
+            Log.d(TAG, "定位到输入条[$label] rect=$r → 点按 ($x, ${r.centerY()})")
+            return Point(x, r.centerY())
+        } finally {
+            root.recycle()
+        }
     }
 
     /**
