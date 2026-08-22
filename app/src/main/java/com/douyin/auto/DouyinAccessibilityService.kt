@@ -45,6 +45,7 @@ import android.widget.Toast
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import kotlin.random.Random
+import kotlin.system.exitProcess
 
 /**
  * 抖音无障碍服务 - 核心服务
@@ -1846,15 +1847,38 @@ class DouyinAccessibilityService : AccessibilityService() {
         if (bar.isRealEditText) {
             bar.node.recycle()
         } else {
-            // 伪装输入条：点按展开真正的输入弹窗
-            val r = Rect()
-            bar.node.getBoundsInScreen(r)
-            Log.d(TAG, "输入条为伪装节点，点按展开输入弹窗 (${r.centerX()}, ${r.centerY()})")
-            if (!bar.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            // 伪装输入条：手势点按展开真正的输入弹窗并唤出键盘。
+            // 不能用 performAction(ACTION_CLICK)——抖音自定义输入条常「假成功」（返回 true 但不展开），
+            // 导致输入弹窗/键盘没唤起，后续写入失败。手势点按坐标更可靠。
+            var expanded = false
+            repeat(3) { attempt ->
+                val root = rootInActiveWindow
+                val r = Rect()
+                if (root != null) {
+                    try {
+                        val fb = findCommentInputBar(root, requireRealEditText = false)
+                        if (fb != null) {
+                            fb.node.getBoundsInScreen(r)
+                            fb.node.recycle()
+                        }
+                    } finally {
+                        root.recycle()
+                    }
+                }
+                if (r.isEmpty) return@repeat
+                Log.d(TAG, "输入条为伪装节点，手势点按展开输入弹窗，第${attempt + 1}次 (${r.centerX()}, ${r.centerY()})")
                 dispatchTap(r.centerX(), r.centerY())
+                delay(900)
+                // 弹窗唤起成功 = 出现真正的输入框（EditText）
+                if (waitForCommentInputBar(1200, requireRealEditText = true) != null) {
+                    expanded = true
+//                    exitProcess(0)
+                    break
+                }
             }
-            bar.node.recycle()
-            delay(800)
+            if (!expanded) {
+                Log.w(TAG, "点按伪装输入条多次仍未唤起输入弹窗（键盘未弹出），写入流程降级继续")
+            }
         }
 
         if (tryWriteComment(text, tapFirst = true, usePaste = true)) {
