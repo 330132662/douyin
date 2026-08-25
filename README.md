@@ -7,7 +7,16 @@
 ## 软件架构
 两个库可按照习惯自行选择，  
 主要更新库   https://gitee.com/jeffcat/douyin   
-镜像库 https://github.com/330132662/douyin 
+镜像库 https://github.com/330132662/douyin     
+
+
+
+**FastAIToken** 是面向开发者的 AI API 聚合平台，支持 OpenAI、Claude、Gemini 等主流大模型，兼容 OpenAI API 协议，可无缝接入 **Claude Code、Codex、Gemini CLI、Cherry Studio、Cline、Continue** 等各类 AI 开发工具。平台采用 **充值 1:1（1 元 = 1 美元 API 额度）**，帮助开发者以更低成本、更高效率地使用全球领先的大模型服务。
+
+平台提供多个可选分组与公开状态页，开发者可根据成本、响应速度和稳定性自由选择不同渠道，并享受 **7×24 小时真人技术支持**（非机器人）。
+
+**主要做 AI 开发接入？可以试试 [FastAIToken](https://www.fastaitoken.com/register?aff=UTM76VNGEDZN)，兼容 Codex / Claude Code / Gemini CLI 等主流工具。**
+
 
 ## 怎么用
 
